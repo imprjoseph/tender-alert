@@ -1,0 +1,14 @@
+name: diag
+on: workflow_dispatch
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          UA_B="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+          for u in "https://pcc-api.openfun.app/api/listbydate?date=20261014" "https://pcc.g0v.ronny.tw/api/listbydate?date=20261014" "https://pcc-api.openfun.app/" ; do
+            a=$(curl -s -o /tmp/o -w "%{http_code}" -A "imPR-tender-alert/1.0" "$u"); b=$(curl -s -o /tmp/p -w "%{http_code}" -A "$UA_B" -H "Accept: application/json" "$u"); c=$(curl -sL -o /tmp/q -w "%{http_code} %{url_effective}" -A "$UA_B" "$u")
+            echo "::notice title=$u::ua_bot=$a ua_browser=$b follow=$c body=$(head -c 120 /tmp/p | tr -d '\n\"')"
+          done
+          echo "::notice title=ip::$(curl -s https://api.ipify.org)"
+          echo "::notice title=pcc-official::$(curl -s -o /dev/null -w '%{http_code}' -A "$UA_B" 'https://web.pcc.gov.tw/prkms/today/common/todayTender')"
