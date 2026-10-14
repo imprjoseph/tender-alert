@@ -150,7 +150,11 @@ def fetch_detail(pk: str) -> dict:
             if d["category"] or d["deadline"]:
                 return d
             t = re.search(r"<title>(.*?)</title>", r.text, re.S)
-            last = f"HTTP {r.status_code} len={len(r.text)} title={_text(t.group(1)) if t else ''} body={_text(r.text)[:160]}"
+            clean = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", r.text, flags=re.S | re.I)
+            body = _text(clean)
+            key = re.search(r".{0,120}(驗證|查無|錯誤|逾時|不存在|權限|稍後|Error|error).{0,200}", body)
+            last = (f"HTTP {r.status_code} len={len(r.text)} url={r.url} "
+                    f"msg={key.group(0) if key else body[-300:]}")
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {e}"
         time.sleep(5 * (attempt + 1))
