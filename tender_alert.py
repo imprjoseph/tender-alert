@@ -400,6 +400,9 @@ def main() -> int:
     stats = {"scanned": scanned, "dates": f"{dates[-1]:%m/%d}–{dates[0]:%m/%d}" if len(dates) > 1 else f"{dates[0]:%m/%d}"}
 
     print(f"✅ 最終符合 {len(items)} 件")
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::notice title=標案快報::掃描 {scanned} 筆，初篩 {len(candidates)} 件，最終 {len(items)} 件"
+              + ("｜" + "；".join(i['title'][:25] for i in items[:5]) if items else ""))
     for it in items:
         print(f"  [{it['score']}] {it['title']}｜{it['unit_name']}｜{fmt_money(it.get('budget'))}｜{it.get('deadline_str')}｜{'、'.join(it['keywords'])}")
 
@@ -430,4 +433,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        if os.environ.get("GITHUB_ACTIONS"):
+            msg = f"{type(e).__name__}: {e}"[:900].replace("\n", " ")
+            print(f"::error title=標案快報執行失敗::{msg}")
+        sys.exit(1)
