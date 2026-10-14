@@ -116,13 +116,10 @@ def _field(flat: str, label: str) -> str:
     return _text(m.group(1)) if m else ""
 
 
-def fetch_detail(pk: str) -> dict:
-    try:
-        html = _get_html(DETAIL_URL.format(pk=pk), f"detail_{pk}.html")
-    except RuntimeError:
-        return {}
-    if not html:
-        return {}
+_detail_debug_done = False
+
+
+def _parse_detail(html: str) -> dict:
     flat = re.sub(r"\s+", " ", html)
     d = {
         "category": _field(flat, "標的分類"),
@@ -136,6 +133,31 @@ def fetch_detail(pk: str) -> dict:
         m = re.search(r'isVal = "(\d+)"', flat)
         d["budget_text"] = m.group(1) if m else d["budget_text"]
     return d
+
+
+def fetch_detail(pk: str) -> dict:
+    global _detail_debug_done
+    url = DETAIL_URL.format(pk=pk)
+    if FIXTURE_DIR:
+        html = _get_html(url, f"detail_{pk}.html")
+        return _parse_detail(html) if html else {}
+    last = ""
+    for attempt in range(3):
+        try:
+            r = _session.get(url, timeout=40, headers={"Referer": TODAY_URL})
+            r.encoding = "utf-8"
+            d = _parse_detail(r.text)
+            if d["category"] or d["deadline"]:
+                return d
+            t = re.search(r"<title>(.*?)</title>", r.text, re.S)
+            last = f"HTTP {r.status_code} len={len(r.text)} title={_text(t.group(1)) if t else ''} body={_text(r.text)[:160]}"
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(5 * (attempt + 1))
+    if os.environ.get("GITHUB_ACTIONS") and not _detail_debug_done:
+        print(f"::notice title=明細頁失敗樣本::{pk} {last}"[:900])
+        _detail_debug_done = True
+    return {}
 
 
 # ---------------------------------------------------------------- 篩選
@@ -422,7 +444,7 @@ def main() -> int:
     for it in candidates.values():
         it = enrich(it, now, cfg)
         if not FIXTURE_DIR:
-            time.sleep(0.8)
+            time.sleep(2)
         if not it.get("detail_ok"):
             detail_fail += 1
         if it.get("_drop"):
