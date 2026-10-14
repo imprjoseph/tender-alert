@@ -203,10 +203,12 @@ def parse_money(s: str) -> int | None:
 def enrich(item: dict, now: datetime, cfg: dict) -> dict | None:
     """抓明細並做二次過濾；回傳 None 表示被濾掉。"""
     d = fetch_detail(item["pk"]) if item["pk"] else {}
+    item["detail_ok"] = bool(d.get("category") or d.get("deadline"))
     f = cfg["filters"]
     item["category"] = d.get("category", "")
     if contains_any(item["category"], f.get("category_exclude", [])):
-        return None
+        item["_drop"] = "分類"
+        return item
     boost = contains_any(item["category"], f.get("category_boost", []))
     if boost:
         item["score"] += f.get("category_boost_score", 2)
@@ -415,27 +417,35 @@ def main() -> int:
     print(f"🔎 關鍵字初篩命中 {len(candidates)} 件，抓取明細中…")
     items = []
     bmin, bmax = opts.get("budget_min"), opts.get("budget_max")
+    drop = {"分類": 0, "預算": 0, "過期": 0}
+    detail_fail = 0
     for it in candidates.values():
         it = enrich(it, now, cfg)
         if not FIXTURE_DIR:
             time.sleep(0.8)
-        if not it:
+        if not it.get("detail_ok"):
+            detail_fail += 1
+        if it.get("_drop"):
+            drop[it["_drop"]] += 1
             continue
         b = it.get("budget")
-        if b is not None and bmin and b < bmin:
-            continue
-        if b is not None and bmax and b > bmax:
+        if b is not None and ((bmin and b < bmin) or (bmax and b > bmax)):
+            drop["預算"] += 1
             continue
         if opts.get("skip_expired", True) and it.get("days_left") is not None and it["days_left"] < 0:
+            drop["過期"] += 1
             continue
         items.append(it)
 
     items.sort(key=lambda x: (-x["score"], x["days_left"] if x.get("days_left") is not None else 999))
     stats = {"scanned": len(recs), "dates": now.strftime("%m/%d")}
 
-    print(f"✅ 最終符合 {len(items)} 件")
+    print(f"✅ 最終符合 {len(items)} 件（排除 {drop}，明細失敗 {detail_fail}）")
+    if detail_fail and detail_fail == len(candidates) and os.environ.get("GITHUB_ACTIONS"):
+        print("::warning title=明細頁::全部明細頁抓取失敗，分類/預算過濾未生效")
     if os.environ.get("GITHUB_ACTIONS"):
-        print(f"::notice title=標案快報::今日 {len(recs)} 筆，初篩 {len(candidates)} 件，最終 {len(items)} 件"
+        print(f"::notice title=標案快報::今日 {len(recs)} 筆，初篩 {len(candidates)} 件，"
+              f"排除 分類{drop['分類']}/預算{drop['預算']}/過期{drop['過期']}，明細失敗 {detail_fail}，最終 {len(items)} 件"
               + ("｜" + "；".join(i['title'][:25] for i in items[:5]) if items else ""))
     for it in items:
         print(f"  [{it['score']}] {it['title']}｜{it['unit_name']}｜{fmt_money(it.get('budget'))}"
