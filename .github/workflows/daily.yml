@@ -2,17 +2,14 @@ name: 每日標案快報
 
 on:
   schedule:
-    # 台灣時間 週一～週五 07:23（UTC 前一天 23:23）
-    # GitHub 排程尖峰可能延遲 5–30 分鐘；避開整點較準時
-    - cron: "23 23 * * 0-4"
+    # 每天 台灣時間 07:23（UTC 前一天 23:23）。資料來源為「今日招標」頁，需每天執行才不漏案
+    # 週末若無新案不寄信；GitHub 排程尖峰可能延遲 5–30 分鐘
+    - cron: "23 23 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "只預覽，不寄送（true/false）"
         default: "false"
-      date:
-        description: "指定日期 YYYYMMDD（留空 = 最近幾天）"
-        default: ""
 
 permissions:
   contents: write   # 需要把 data/seen.json、matches.csv、reports/ 存回 repo
@@ -48,7 +45,6 @@ jobs:
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
-          if [ -n "${{ github.event.inputs.date }}" ]; then ARGS="$ARGS --date ${{ github.event.inputs.date }}"; fi
           python tender_alert.py $ARGS
 
       - name: 上傳 Email 預覽（dry-run 時）

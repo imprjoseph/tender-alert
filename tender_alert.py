@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 政府電子採購網 每日標案關鍵字通知
-資料來源：政府電子採購網（經 g0v 標案 API：https://pcc-api.openfun.app）
+資料來源：政府電子採購網 https://web.pcc.gov.tw （官方「今日招標」頁 + 標案明細頁）
 
 流程：
-  1. 抓最近 N 天的公告清單（/api/listbydate）
-  2. 依「公告類型 → 標的分類 → 關鍵字 / 排除詞」篩選
+  1. 抓「今日招標」全部公告（一次請求，約 1,000–1,500 筆）
+  2. 依「公告類型 → 機關 → 案名排除詞 → 關鍵字群組」初篩
   3. 已通知過的案件跳過（data/seen.json）
-  4. 對命中案件抓明細（預算、截止投標、官方連結）
-  5. 寄 Email / 推 LINE，並寫入 data/matches.csv 與 reports/
+  4. 對命中案件抓明細頁：標的分類、預算、截止投標、決標方式
+  5. 依標的分類二次過濾（排除工程／財物）、預算區間、已過期
+  6. 寄 Email / 推 LINE，並寫入 data/matches.csv 與 reports/
 
 用法：
   python tender_alert.py                 # 正式執行
   python tender_alert.py --dry-run       # 只印結果，不寄送、不更新 seen
-  python tender_alert.py --date 20261013 # 指定日期（測試用）
+  python tender_alert.py --ignore-seen   # 忽略已通知紀錄（測試用）
 """
 from __future__ import annotations
 
@@ -25,11 +26,11 @@ import re
 import smtplib
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -43,73 +44,117 @@ REPORT_DIR = ROOT / "reports"
 SEEN_FILE = DATA_DIR / "seen.json"
 MATCH_CSV = DATA_DIR / "matches.csv"
 
-API_BASE = os.environ.get("PCC_API_BASE", "https://pcc-api.openfun.app")
-FIXTURE_DIR = os.environ.get("PCC_FIXTURE_DIR")  # 離線測試用
-UA = "imPR-tender-alert/1.0 (+github actions)"
+PCC = "https://web.pcc.gov.tw"
+TODAY_URL = f"{PCC}/prkms/today/common/todayTender"
+DETAIL_URL = f"{PCC}/tps/QueryTender/query/searchTenderDetail?pkPmsMain={{pk}}"
+FIXTURE_DIR = os.environ.get("PCC_FIXTURE_DIR")  # 離線測試用：today.html、detail_<pk>.html
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+
+_session = requests.Session()
+_session.headers.update({"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9"})
 
 
 # ---------------------------------------------------------------- 資料抓取
-def _get_json(path: str, params: dict) -> dict:
+def _get_html(url: str, fixture: str) -> str:
     if FIXTURE_DIR:
-        key = "_".join(str(v) for v in params.values())
-        f = Path(FIXTURE_DIR) / f"{path.strip('/').replace('/', '_')}_{key}.json"
-        return json.loads(f.read_text("utf-8")) if f.exists() else {"records": []}
-
-    url = f"{API_BASE}{path}"
+        f = Path(FIXTURE_DIR) / fixture
+        return f.read_text("utf-8", errors="replace") if f.exists() else ""
     last_err = None
     for attempt in range(4):
         try:
-            r = requests.get(url, params=params, timeout=30, headers={"User-Agent": UA})
+            r = _session.get(url, timeout=40)
             r.raise_for_status()
-            return r.json()
+            r.encoding = "utf-8"
+            return r.text
         except Exception as e:  # noqa: BLE001
             last_err = e
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"API 失敗：{url} {params} → {last_err}")
+            time.sleep(4 * (attempt + 1))
+    raise RuntimeError(f"採購網連線失敗：{url} → {last_err}")
 
 
-def list_by_date(d: date) -> list[dict]:
-    return _get_json("/api/listbydate", {"date": d.strftime("%Y%m%d")}).get("records", [])
+def _text(html: str) -> str:
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", html))).strip()
 
 
-def tender_detail(unit_id: str, job_number: str, filename: str) -> dict:
+def fetch_today() -> list[dict]:
+    """解析「今日招標」頁：每個公告類型一個區塊，底下是案件表格。"""
+    html = _get_html(TODAY_URL, "today.html")
+    if not html:
+        raise RuntimeError("今日招標頁為空")
+    flat = re.sub(r"\s+", " ", html)
+    # 以各區塊標題切段：□公開招標公告□ 總筆數:597
+    parts = re.split(r"<strong>\s*□(.+?)□\s*總筆數:\s*\d+\s*</strong>", flat)
+    recs, today = [], datetime.now(TZ).strftime("%Y%m%d")
+    for i in range(1, len(parts), 2):
+        ttype, body = parts[i].strip(), parts[i + 1]
+        tb = re.search(r"<tbody>(.*?)</tbody>", body)
+        if not tb:
+            continue
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb.group(1)):
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", tr)
+            if len(tds) < 5:
+                continue
+            pk = re.search(r"pkPmsMain=([^\"&]+)", tds[3])
+            recs.append({
+                "date": today,
+                "type": ttype,
+                "unit_name": _text(tds[1]),
+                "title": _text(tds[2]),
+                "job_number": _text(tds[3]),
+                "pk": pk.group(1) if pk else "",
+                "deadline_list": _text(tds[4]),
+            })
+    if not recs:
+        raise RuntimeError("今日招標頁解析不到任何案件，網頁結構可能已改版")
+    return recs
+
+
+def _field(flat: str, label: str) -> str:
+    m = re.search(r'<td[^>]*class="tbg_\w+"[^>]*>\s*' + re.escape(label) +
+                  r'\s*</td>\s*<td[^>]*>(.*?)</td>\s*</tr>', flat)
+    return _text(m.group(1)) if m else ""
+
+
+def fetch_detail(pk: str) -> dict:
     try:
-        data = _get_json("/api/tender", {"unit_id": unit_id, "job_number": job_number})
+        html = _get_html(DETAIL_URL.format(pk=pk), f"detail_{pk}.html")
     except RuntimeError:
         return {}
-    for rec in data.get("records", []):
-        if rec.get("filename") == filename:
-            return rec.get("detail", {}) or {}
-    return {}
+    if not html:
+        return {}
+    flat = re.sub(r"\s+", " ", html)
+    d = {
+        "category": _field(flat, "標的分類"),
+        "budget_text": _field(flat, "預算金額"),
+        "deadline": _field(flat, "截止投標"),
+        "award_method": _field(flat, "決標方式"),
+        "tender_way": _field(flat, "招標方式"),
+        "unit_id": _field(flat, "機關代碼"),
+    }
+    if not re.search(r"\d", d["budget_text"] or ""):
+        m = re.search(r'isVal = "(\d+)"', flat)
+        d["budget_text"] = m.group(1) if m else d["budget_text"]
+    return d
 
 
 # ---------------------------------------------------------------- 篩選
 def contains_any(text: str, words: list[str]) -> list[str]:
-    return [w for w in words or [] if w and w in text]
+    return [w for w in words or [] if w and w in (text or "")]
 
 
 def match_record(rec: dict, cfg: dict) -> dict | None:
-    brief = rec.get("brief", {}) or {}
-    ttype = brief.get("type", "")
-    title = brief.get("title", "") or ""
-    category = brief.get("category", "") or ""
-    unit = rec.get("unit_name", "") or ""
-
+    """初篩：只用清單頁就有的欄位（類型、機關、案名）。"""
+    ttype, title, unit = rec["type"], rec["title"], rec["unit_name"]
     f = cfg["filters"]
-    # 1) 公告類型
     if f.get("type_include") and not contains_any(ttype, f["type_include"]):
         return None
     if contains_any(ttype, f.get("type_exclude", [])):
         return None
-    # 2) 標的分類
-    if contains_any(category, f.get("category_exclude", [])):
-        return None
-    # 3) 機關
     if f.get("unit_include") and not contains_any(unit, f["unit_include"]):
         return None
     if contains_any(unit, f.get("unit_exclude", [])):
         return None
-    # 4) 全域排除詞（案名）
     if contains_any(title, f.get("title_exclude", [])):
         return None
 
@@ -126,60 +171,53 @@ def match_record(rec: dict, cfg: dict) -> dict | None:
             groups_hit.append(g["name"])
             kw_hit += hits
             score += g.get("priority", 1) * len(set(hits))
-
-    cat_hits = contains_any(category, f.get("category_boost", []))
-    if cat_hits:
-        score += f.get("category_boost_score", 2)
-        if not groups_hit and f.get("category_boost_alone", True):
-            groups_hit.append("標的分類")
-        kw_hit += cat_hits
-
     if not groups_hit:
         return None
 
     return {
-        "announce_date": str(rec.get("date", "")),
-        "type": ttype,
-        "unit_id": rec.get("unit_id", ""),
-        "unit_name": unit,
-        "job_number": rec.get("job_number", ""),
-        "filename": rec.get("filename", ""),
-        "title": title,
-        "category": category,
+        **rec,
         "groups": groups_hit,
         "keywords": sorted(set(kw_hit), key=kw_hit.index),
         "score": score,
-        "g0v_url": API_BASE + rec.get("url", ""),
+        "url": DETAIL_URL.format(pk=rec["pk"]) if rec["pk"] else TODAY_URL,
     }
 
 
 def roc_to_dt(s: str) -> datetime | None:
     """'115/11/11 17:00' → datetime"""
-    m = re.match(r"(\d{2,3})/(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?", s or "")
+    m = re.search(r"(\d{2,3})/(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?", s or "")
     if not m:
         return None
-    y, mo, d = int(m[1]) + 1911, int(m[2]), int(m[3])
-    hh, mm = int(m[4] or 0), int(m[5] or 0)
     try:
-        return datetime(y, mo, d, hh, mm, tzinfo=TZ)
+        return datetime(int(m[1]) + 1911, int(m[2]), int(m[3]),
+                        int(m[4] or 23), int(m[5] or 59), tzinfo=TZ)
     except ValueError:
         return None
 
 
 def parse_money(s: str) -> int | None:
-    m = re.search(r"[\d,]+", s or "")
+    m = re.search(r"\d[\d,]*", s or "")
     return int(m[0].replace(",", "")) if m else None
 
 
-def enrich(item: dict, now: datetime) -> dict:
-    d = tender_detail(item["unit_id"], item["job_number"], item["filename"])
-    item["budget"] = parse_money(d.get("採購資料:預算金額", ""))
-    item["deadline_str"] = d.get("領投開標:截止投標", "") or d.get("標案內容:公開徵求期間", "")
-    dl = roc_to_dt(item["deadline_str"].split("－")[-1].strip()) if item["deadline_str"] else None
-    item["deadline"] = dl
+def enrich(item: dict, now: datetime, cfg: dict) -> dict | None:
+    """抓明細並做二次過濾；回傳 None 表示被濾掉。"""
+    d = fetch_detail(item["pk"]) if item["pk"] else {}
+    f = cfg["filters"]
+    item["category"] = d.get("category", "")
+    if contains_any(item["category"], f.get("category_exclude", [])):
+        return None
+    boost = contains_any(item["category"], f.get("category_boost", []))
+    if boost:
+        item["score"] += f.get("category_boost_score", 2)
+        item["keywords"] += [b for b in boost if b not in item["keywords"]]
+    item["unit_id"] = d.get("unit_id", "")
+    item["budget"] = parse_money(d.get("budget_text", ""))
+    item["deadline_str"] = d.get("deadline") or item.get("deadline_list", "")
+    dl = roc_to_dt(item["deadline_str"])
     item["days_left"] = (dl.date() - now.date()).days if dl else None
-    item["award_method"] = d.get("招標資料:決標方式", "")
-    item["url"] = d.get("url") or item["g0v_url"]
+    item["award_method"] = d.get("award_method", "")
+    item["announce_date"] = item["date"]
     return item
 
 
@@ -198,7 +236,7 @@ def save_seen(seen: dict, keep_days: int = 120) -> None:
 
 
 def seen_key(it: dict) -> str:
-    return f"{it['unit_id']}|{it['job_number']}|{it['type']}"
+    return f"{it['unit_name']}|{it['job_number']}|{it['type']}"
 
 
 # ---------------------------------------------------------------- 輸出
@@ -239,7 +277,7 @@ def build_html(items: list[dict], run_date: str, stats: dict) -> str:
   <div style="padding:20px 20px 12px;border-bottom:3px solid #1d4ed8">
     <div style="font-size:20px;font-weight:700;color:#111827">政府標案每日快報｜{run_date}</div>
     <div style="font-size:13px;color:#6b7280;margin-top:4px">
-      掃描 {stats['scanned']} 筆公告（{stats['dates']}）→ 新符合 <b style="color:#1d4ed8">{len(items)}</b> 件
+      今日招標 {stats['scanned']} 筆（{stats['dates']}）→ 新符合 <b style="color:#1d4ed8">{len(items)}</b> 件
     </div>
   </div>
   <table style="width:100%;border-collapse:collapse">
@@ -248,7 +286,7 @@ def build_html(items: list[dict], run_date: str, stats: dict) -> str:
     </tr>{body}
   </table>
   <div style="padding:16px 20px;font-size:11px;color:#9ca3af">
-    資料來源：政府電子採購網（經 g0v 標案 API）。請以政府電子採購網公告內容為準。<br>
+    資料來源：政府電子採購網。請以採購網公告內容為準。<br>
     調整關鍵字：編輯 repo 中的 config.yml。
   </div>
 </div></body></html>"""
@@ -350,7 +388,6 @@ def write_report(items: list[dict], run_date: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "config.yml"))
-    ap.add_argument("--date", help="只掃指定日期 YYYYMMDD（測試用）")
     ap.add_argument("--dry-run", action="store_true", help="不寄送、不寫入狀態")
     ap.add_argument("--ignore-seen", action="store_true", help="忽略已通知紀錄（測試用）")
     args = ap.parse_args()
@@ -359,34 +396,31 @@ def main() -> int:
     opts = cfg.get("options", {})
     now = datetime.now(TZ)
     run_date = now.strftime("%Y-%m-%d")
-
-    if args.date:
-        dates = [datetime.strptime(args.date, "%Y%m%d").date()]
-    else:
-        n = int(opts.get("lookback_days", 3))
-        dates = [(now - timedelta(days=i)).date() for i in range(n)]
+    is_weekend = now.weekday() >= 5
 
     seen = {} if args.ignore_seen else load_seen()
-    scanned, candidates = 0, {}
-    for d in dates:
-        recs = list_by_date(d)
-        scanned += len(recs)
-        print(f"📥 {d:%Y-%m-%d} 公告 {len(recs)} 筆")
-        for rec in recs:
-            it = match_record(rec, cfg)
-            if not it:
-                continue
-            k = seen_key(it)
-            if k in seen or k in candidates:
-                continue
-            candidates[k] = it
+    recs = fetch_today()
+    print(f"📥 今日招標 {len(recs)} 筆")
+
+    candidates = {}
+    for rec in recs:
+        it = match_record(rec, cfg)
+        if not it:
+            continue
+        k = seen_key(it)
+        if k in seen or k in candidates:
+            continue
+        candidates[k] = it
 
     print(f"🔎 關鍵字初篩命中 {len(candidates)} 件，抓取明細中…")
     items = []
     bmin, bmax = opts.get("budget_min"), opts.get("budget_max")
-    for k, it in candidates.items():
-        it = enrich(it, now)
-        time.sleep(0.3 if not FIXTURE_DIR else 0)
+    for it in candidates.values():
+        it = enrich(it, now, cfg)
+        if not FIXTURE_DIR:
+            time.sleep(0.8)
+        if not it:
+            continue
         b = it.get("budget")
         if b is not None and bmin and b < bmin:
             continue
@@ -396,39 +430,41 @@ def main() -> int:
             continue
         items.append(it)
 
-    items.sort(key=lambda x: (-x["score"], x.get("days_left") if x.get("days_left") is not None else 999))
-    stats = {"scanned": scanned, "dates": f"{dates[-1]:%m/%d}–{dates[0]:%m/%d}" if len(dates) > 1 else f"{dates[0]:%m/%d}"}
+    items.sort(key=lambda x: (-x["score"], x["days_left"] if x.get("days_left") is not None else 999))
+    stats = {"scanned": len(recs), "dates": now.strftime("%m/%d")}
 
     print(f"✅ 最終符合 {len(items)} 件")
     if os.environ.get("GITHUB_ACTIONS"):
-        print(f"::notice title=標案快報::掃描 {scanned} 筆，初篩 {len(candidates)} 件，最終 {len(items)} 件"
+        print(f"::notice title=標案快報::今日 {len(recs)} 筆，初篩 {len(candidates)} 件，最終 {len(items)} 件"
               + ("｜" + "；".join(i['title'][:25] for i in items[:5]) if items else ""))
     for it in items:
-        print(f"  [{it['score']}] {it['title']}｜{it['unit_name']}｜{fmt_money(it.get('budget'))}｜{it.get('deadline_str')}｜{'、'.join(it['keywords'])}")
+        print(f"  [{it['score']}] {it['title']}｜{it['unit_name']}｜{fmt_money(it.get('budget'))}"
+              f"｜{it.get('deadline_str')}｜{it.get('category')}｜{'、'.join(it['keywords'])}")
 
     html = build_html(items, run_date, stats)
     text = build_text(items, run_date)
     if args.dry_run:
-        out = ROOT / "preview.html"
-        out.write_text(html, "utf-8")
-        print(f"\n(dry-run) Email 預覽已存到 {out}\n---- LINE 預覽 ----\n{text}")
+        (ROOT / "preview.html").write_text(html, "utf-8")
+        print(f"\n(dry-run) Email 預覽已存到 preview.html\n---- LINE 預覽 ----\n{text}")
         return 0
 
-    if items or opts.get("send_when_empty", True):
+    send_empty = opts.get("send_when_empty", True) and not is_weekend
+    if items or send_empty:
         subject = f"【標案快報】{run_date} 新案 {len(items)} 件" + (
             f"｜{items[0]['title'][:20]}…" if items else "")
         send_email(subject, html, text)
         if items or opts.get("line_when_empty", False):
             send_line(text)
+    else:
+        print("ℹ️  無新案（週末不寄空報）")
 
-    for it in items:
-        seen[seen_key(it)] = now.strftime("%Y%m%d")
-    # 初篩命中但被預算／過期濾掉的也記錄，避免每天重抓明細
-    for k in candidates:
-        seen.setdefault(k, now.strftime("%Y%m%d"))
+    stamp = now.strftime("%Y%m%d")
+    for k in candidates:          # 含被分類／預算／過期濾掉者，避免每天重抓明細
+        seen.setdefault(k, stamp)
     save_seen(seen)
-    append_csv(items, run_date)
-    write_report(items, run_date)
+    if items:
+        append_csv(items, run_date)
+        write_report(items, run_date)
     return 0
 
 
@@ -437,8 +473,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:  # noqa: BLE001
         import traceback
-        tb = traceback.format_exc()
-        print(tb)
+        print(traceback.format_exc())
         if os.environ.get("GITHUB_ACTIONS"):
             msg = f"{type(e).__name__}: {e}"[:900].replace("\n", " ")
             print(f"::error title=標案快報執行失敗::{msg}")

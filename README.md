@@ -1,23 +1,23 @@
 # 政府標案每日快報（GitHub Actions 版）
 
-每個工作日早上 07:30 左右，自動掃描政府電子採購網的新公告，依 `config.yml` 的關鍵字篩選，
+每天早上 07:30 左右，自動掃描政府電子採購網「今日招標」的全部公告，依 `config.yml` 的關鍵字篩選，
 把符合的案件寄到 Email（可選 LINE），並累積到 `data/matches.csv` 作為標案情報庫。
 
 - 成本：0 元（GitHub Actions 免費額度內，每次約 1 分鐘）
-- 資料來源：政府電子採購網，經 g0v 標案 API（`pcc-api.openfun.app`）取得
-- 不需要伺服器，不需要維護爬蟲
+- 資料來源：政府電子採購網官方頁面（今日招標 + 標案明細）
+- 不需要伺服器
 
 ---
 
 ## 運作邏輯
 
 ```
-GitHub Actions（週一～五 07:23 TW）
+GitHub Actions（每天 07:23 TW）
    │
-   ├─ 1. 抓最近 3 天公告清單（每天約 1,500–3,000 筆）
-   ├─ 2. 篩選：公告類型 → 排除工程/財物類 → 案名排除詞 → 關鍵字群組 / 分類加分
+   ├─ 1. 抓「今日招標」全部公告（每天約 1,000–1,500 筆，一次請求）
+   ├─ 2. 初篩：公告類型 → 機關 → 案名排除詞 → 關鍵字群組
    ├─ 3. 跳過已通知過的案件（data/seen.json）
-   ├─ 4. 抓命中案件明細：預算、截止投標、官方連結
+   ├─ 4. 抓命中案件明細頁：標的分類、預算、截止投標；排除工程／財物類
    ├─ 5. 預算區間、已過期過濾 → 依「優先度分數、剩餘天數」排序
    └─ 6. 寄 Email / 推 LINE → 寫入 matches.csv、reports/日期.md → commit 回 repo
 ```
@@ -57,7 +57,7 @@ Google 帳戶 → 安全性 → 開啟兩步驟驗證 → 「應用程式密碼�
 - `dry_run = true`：不寄信，完成後在該次執行頁下載 `preview` 看 Email 樣式
 - `dry_run = false`：正式寄出，並開始記錄已通知案件
 
-確認收到信後就不用再管它，每個工作日會自動執行。
+確認收到信後就不用再管它，每天會自動執行（週末無新案不寄信）。
 
 ---
 
@@ -75,7 +75,7 @@ Google 帳戶 → 安全性 → 開啟兩步驟驗證 → 「應用程式密碼�
 | 改執行時間 | `.github/workflows/daily.yml` 的 `cron`（UTC 時間，台灣 −8 小時） |
 
 **關鍵字設計心法**
-- 招標案名常不寫具體內容，例如「115年度○○計畫委託專業服務」，所以保留「委辦計畫」群組（低優先度）與 `category_boost`（標的分類命中即通知）兩道網。
+- 只看案名比對；標的分類在明細頁取得後用於排除工程/財物、與 `category_boost` 加分排序。
 - 先寬後窄：前兩週先收多一點，看哪些是雜訊，再加進 `title_exclude`。
 - 「活動」會撞到「活動中心整修」，已用 `工程類` 排除 + 群組 `exclude` 處理。
 
@@ -107,8 +107,8 @@ Google 帳戶 → 安全性 → 開啟兩步驟驗證 → 「應用程式密碼�
 
 ```bash
 pip install -r requirements.txt
-python tender_alert.py --dry-run                 # 掃最近 3 天，產生 preview.html
-python tender_alert.py --date 20261013 --dry-run --ignore-seen
+python tender_alert.py --dry-run                 # 掃今日招標，產生 preview.html
+python tender_alert.py --dry-run --ignore-seen   # 忽略已通知紀錄
 ```
 
 ---
@@ -118,8 +118,11 @@ python tender_alert.py --date 20261013 --dry-run --ignore-seen
 **Q：排程沒在 07:30 準時跑？**
 GitHub 排程在尖峰時段會延遲數分鐘到半小時，屬正常現象。需要準時可改用手動觸發或外部排程。
 
-**Q：g0v API 掛掉怎麼辦？**
-程式會重試 4 次；仍失敗則該次 Action 顯示紅燈，GitHub 會寄失敗通知給 repo 擁有者。隔天執行時，`lookback_days: 3` 會自動補抓漏掉的日期。
+**Q：採購網連不上或改版怎麼辦？**
+程式會重試 4 次；仍失敗則該次 Action 顯示紅燈並在 Summary 顯示錯誤原因，GitHub 會寄失敗通知給 repo 擁有者。若某天失敗，那天的公告需手動到採購網補查。
+
+**Q：為什麼不用 g0v API？**
+g0v 標案 API 前面有 Cloudflare 機器人檢查，會擋 GitHub 伺服器的連線（實測 403），因此改抓官方頁面。
 
 **Q：公開 repo 可以嗎？**
 建議用 Private。Public repo 若 60 天無 commit 會自動停用排程（本系統每天都會 commit，實務上不會發生），但案件清單與關鍵字策略會公開。
