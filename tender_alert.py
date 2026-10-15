@@ -482,13 +482,18 @@ def push_sheet(rows: list[dict]) -> bool:
     """把新增／變動的列送到 Google Sheet（Apps Script Web App）。失敗的列存起來下次重送。"""
     url, token = os.environ.get("GAS_URL"), os.environ.get("GAS_TOKEN")
     pending = json.loads(PENDING_FILE.read_text("utf-8")) if PENDING_FILE.exists() else []
-    if not url or not token:
-        if rows:
-            print("ℹ️  未設定 GAS_URL / GAS_TOKEN，略過雲端試算表同步")
-        return False
     merged = {r["主鍵"]: r for r in pending}
     merged.update({r["主鍵"]: r for r in rows})
-    allrows = list(merged.values())
+    # 由舊到新送出：Apps Script 每批插在最上方，最後最新的會在最上面
+    allrows = sorted(merged.values(), key=lambda r: (r.get("公告日", ""), r.get("首次收錄", "")))
+    if not url or not token:
+        if allrows:
+            DATA_DIR.mkdir(exist_ok=True)
+            PENDING_FILE.write_text(json.dumps(allrows, ensure_ascii=False), "utf-8")
+            print(f"ℹ️  未設定 GAS_URL / GAS_TOKEN，{len(allrows)} 筆暫存，設定後自動補送")
+            if os.environ.get("GITHUB_ACTIONS"):
+                print(f"::warning title=雲端試算表::未設定 GAS_URL / GAS_TOKEN Secrets，{len(allrows)} 筆暫存待送")
+        return False
     if not allrows:
         return True
     failed, added, updated = [], 0, 0
