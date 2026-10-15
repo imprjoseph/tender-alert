@@ -77,6 +77,61 @@ def _text(html: str) -> str:
     return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", html))).strip()
 
 
+SEARCH_URL = (f"{PCC}/prkms/tender/common/basic/readTenderBasic?pageSize=100&firstSearch=true"
+              "&searchType=basic&isBinding=N&isLogIn=N&level_1=on&tenderType=TENDER_DECLARATION"
+              "&tenderWay=TENDER_WAY_ALL_DECLARATION&dateType=isDate&radProctrgCate={cate}"
+              "&tenderStartDate={start}&tenderEndDate={end}")
+CATE_CODE = {"工程類": "RAD_PROCTRG_CATE_1", "財物類": "RAD_PROCTRG_CATE_2", "勞務類": "RAD_PROCTRG_CATE_3", "不限": ""}
+
+
+def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pages: int = 30) -> list[dict]:
+    """官方「標案查詢」：依採購性質＋公告日期區間，逐頁取回（每頁 100 筆，間隔 4 秒）。"""
+    from urllib.parse import quote
+    base = SEARCH_URL.format(cate=CATE_CODE.get(cate, ""), start=quote(start.strftime("%Y/%m/%d"), safe=""),
+                             end=quote(end.strftime("%Y/%m/%d"), safe=""))
+    recs, total = [], None
+    for page in range(1, max_pages + 1):
+        url = base if page == 1 else f"{base}&firstSearch=false&d-49738-p={page}"
+        html = _get_html(url, f"search_p{page}.html")
+        if "驗證碼檢核" in html:
+            raise CaptchaBlocked()
+        flat = re.sub(r"\s+", " ", html)
+        if total is None:
+            m = re.search(r'共有<span class="red">\s*([\d,]+)\s*</span>筆', flat)
+            total = int(m.group(1).replace(",", "")) if m else 0
+        tb = flat[flat.find("<tbody>", flat.find('id="tpam"')):]
+        rows = re.findall(r'<tr class="tb_b[23]">(.*?)</tr>', tb)
+        for r in rows:
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", r)
+            if len(tds) < 9:
+                continue
+            title = re.search(r'pageCode2Img\("(.*?)"\)', tds[2])
+            case_cell = _text(re.sub(r"<script.*?</script>", " ", tds[2]))
+            is_corr = "更正公告" in case_cell
+            job = case_cell.split("(")[0].strip().split(" ")[0]
+            pk = re.search(r"tpam\?pk=([^\"&]+)", r)
+            way = _text(tds[4])
+            ann = roc_to_dt(_text(tds[6]))
+            recs.append({
+                "date": ann.strftime("%Y%m%d") if ann else "",
+                "type": f"{way}公告" + ("（更正公告）" if is_corr else ""),
+                "unit_name": _text(tds[1]),
+                "title": unescape(title.group(1)) if title else case_cell,
+                "job_number": job,
+                "seq": _text(tds[3]),
+                "pk": pk.group(1) if pk else "",
+                "category": _text(tds[5]),
+                "deadline_list": _text(tds[7]),
+                "budget_text": _text(tds[8]),
+                "source": "search",
+            })
+        if len(rows) < 100 or (total and len(recs) >= total):
+            break
+        if not FIXTURE_DIR:
+            time.sleep(4)
+    return recs
+
+
 def fetch_today() -> list[dict]:
     """解析「今日招標」頁：每個公告類型一個區塊，底下是案件表格。"""
     html = _get_html(TODAY_URL, "today.html")
@@ -195,7 +250,8 @@ def match_record(rec: dict, cfg: dict) -> dict | None:
         "groups": groups_hit,
         "keywords": sorted(set(kw_hit), key=kw_hit.index),
         "score": score,
-        "url": DETAIL_URL.format(pk=rec["pk"]) if rec["pk"] else TODAY_URL,
+        "url": (f"{PCC}/prkms/urlSelector/common/tpam?pk={rec['pk']}" if rec.get("source") == "search"
+                else DETAIL_URL.format(pk=rec["pk"])) if rec["pk"] else TODAY_URL,
     }
 
 
@@ -220,7 +276,7 @@ def enrich(item: dict, now: datetime, cfg: dict, d: dict) -> dict:
     """套用明細（可能為空）並做二次過濾；被濾掉者標記 _drop。"""
     item["detail_ok"] = bool(d.get("category") or d.get("deadline"))
     f = cfg["filters"]
-    item["category"] = d.get("category", "")
+    item["category"] = d.get("category") or item.get("category", "")
     if contains_any(item["category"], f.get("category_exclude", [])):
         item["_drop"] = "分類"
         return item
@@ -229,7 +285,7 @@ def enrich(item: dict, now: datetime, cfg: dict, d: dict) -> dict:
         item["score"] += f.get("category_boost_score", 2)
         item["keywords"] += [b for b in boost if b not in item["keywords"]]
     item["unit_id"] = d.get("unit_id", "")
-    item["budget"] = parse_money(d.get("budget_text", ""))
+    item["budget"] = parse_money(d.get("budget_text") or item.get("budget_text", ""))
     item["deadline_str"] = d.get("deadline") or item.get("deadline_list", "")
     dl = roc_to_dt(item["deadline_str"])
     item["days_left"] = (dl.date() - now.date()).days if dl else None
@@ -240,9 +296,16 @@ def enrich(item: dict, now: datetime, cfg: dict, d: dict) -> dict:
 
 # ---------------------------------------------------------------- 狀態檔
 def load_seen() -> dict:
-    if SEEN_FILE.exists():
-        return json.loads(SEEN_FILE.read_text("utf-8"))
-    return {}
+    if not SEEN_FILE.exists():
+        return {}
+    raw = json.loads(SEEN_FILE.read_text("utf-8"))
+    out = {}
+    for k, v in raw.items():  # 舊格式「機關|案號|公告類型」→「機關|案號|01」
+        parts = k.split("|")
+        if len(parts) >= 3 and not parts[-1].isdigit():
+            k = f"{parts[0]}|{parts[1]}|01"
+        out[k] = v
+    return out
 
 
 def save_seen(seen: dict, keep_days: int = 120) -> None:
@@ -253,7 +316,8 @@ def save_seen(seen: dict, keep_days: int = 120) -> None:
 
 
 def seen_key(it: dict) -> str:
-    return f"{it['unit_name']}|{it['job_number']}|{it['type']}"
+    # 同一案號第二次以上公告（傳輸次數 02、03…，多為流標重新招標）視為新案再通知
+    return f"{it['unit_name']}|{it['job_number']}|{it.get('seq') or '01'}"
 
 
 # ---------------------------------------------------------------- 輸出
@@ -294,7 +358,7 @@ def build_html(items: list[dict], run_date: str, stats: dict) -> str:
   <div style="padding:20px 20px 12px;border-bottom:3px solid #1d4ed8">
     <div style="font-size:20px;font-weight:700;color:#111827">政府標案每日快報｜{run_date}</div>
     <div style="font-size:13px;color:#6b7280;margin-top:4px">
-      今日招標 {stats['scanned']} 筆（{stats['dates']}）→ 新符合 <b style="color:#1d4ed8">{len(items)}</b> 件
+      {stats['dates']} 共 {stats['scanned']} 筆→ 新符合 <b style="color:#1d4ed8">{len(items)}</b> 件
     </div>
   </div>
   <table style="width:100%;border-collapse:collapse">
@@ -416,8 +480,19 @@ def main() -> int:
     is_weekend = now.weekday() >= 5
 
     seen = {} if args.ignore_seen else load_seen()
-    recs = fetch_today()
-    print(f"📥 今日招標 {len(recs)} 筆")
+    lookback = max(1, int(opts.get("lookback_days", 3)))
+    start = now - timedelta(days=lookback - 1)
+    source_note = ""
+    try:
+        recs = fetch_search(start, now, opts.get("category", "勞務類"))
+        source = "search"
+        source_note = f"標案查詢（{opts.get('category', '勞務類')}，{start:%m/%d}–{now:%m/%d}）"
+    except Exception as e:  # noqa: BLE001  — 查詢頁失敗時改用今日招標頁
+        print(f"⚠️  標案查詢失敗（{type(e).__name__}: {e}），改用今日招標頁")
+        recs = fetch_today()
+        source = "today"
+        source_note = f"今日招標（{now:%m/%d}，查詢頁失敗備援）"
+    print(f"📥 {source_note} {len(recs)} 筆")
 
     candidates = {}
     for rec in recs:
@@ -425,7 +500,7 @@ def main() -> int:
         if not it:
             continue
         k = seen_key(it)
-        if k in seen or k in candidates:
+        if k in seen or k in candidates:  # 同案同次只通知一次（更正公告由 type_exclude 排除）
             continue
         candidates[k] = it
 
@@ -438,7 +513,7 @@ def main() -> int:
     detail_ok, blocked = 0, False
     for n, it in enumerate(ranked):
         d = {}
-        if n < max_detail and it["pk"] and not blocked:
+        if source == "today" and n < max_detail and it["pk"] and not blocked:
             try:
                 d = fetch_detail(it["pk"])
                 detail_ok += bool(d)
@@ -461,11 +536,11 @@ def main() -> int:
         items.append(it)
 
     items.sort(key=lambda x: (-x["score"], x["days_left"] if x.get("days_left") is not None else 999))
-    stats = {"scanned": len(recs), "dates": now.strftime("%m/%d")}
+    stats = {"scanned": len(recs), "dates": source_note}
 
     print(f"✅ 最終符合 {len(items)} 件（排除 {drop}，明細 {detail_ok} 件{'，遇驗證碼停止' if blocked else ''}）")
     if os.environ.get("GITHUB_ACTIONS"):
-        print(f"::notice title=標案快報::今日 {len(recs)} 筆，初篩 {len(candidates)} 件，"
+        print(f"::notice title=標案快報::{source_note} {len(recs)} 筆，初篩 {len(candidates)} 件，"
               f"排除 分類{drop['分類']}/預算{drop['預算']}/過期{drop['過期']}，明細 {detail_ok} 件"
               f"{'（遇驗證碼停止）' if blocked else ''}，最終 {len(items)} 件"
               + ("｜" + "；".join(i['title'][:25] for i in items[:5]) if items else ""))
