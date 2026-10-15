@@ -8,8 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "只預覽，不寄送（true/false）"
+        description: "只預覽，不寄送、不寫入（true/false）"
         default: "false"
+      db_only:
+        description: "只更新資料庫與 Excel，不寄信（true/false）"
+        default: "false"
+      days:
+        description: "回補天數（搭配 db_only=true，逐日查詢；留空=依 config）"
+        default: ""
 
 permissions:
   contents: write   # 需要把 data/seen.json、matches.csv、reports/ 存回 repo
@@ -21,7 +27,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -45,6 +51,8 @@ jobs:
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ github.event.inputs.db_only }}" = "true" ]; then ARGS="$ARGS --db-only"; fi
+          if [ -n "${{ github.event.inputs.days }}" ]; then ARGS="$ARGS --days ${{ github.event.inputs.days }}"; fi
           python tender_alert.py $ARGS
 
       - name: 上傳 Email 預覽（dry-run 時）

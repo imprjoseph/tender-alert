@@ -13,6 +13,7 @@ options:
   skip_expired: true        # 已過截止投標日的不通知
   send_when_empty: true     # 平日沒有新案也寄 Email（確認系統有在跑）；週末只在有新案時寄
   line_when_empty: false    # 沒有新案時不推 LINE（避免打擾）
+  attach_excel: true        # Email 附上「標案資料庫.xlsx」（累積全部資料）
 
 filters:
   # ① 公告類型：只看「還能投」的公告

@@ -37,6 +37,8 @@ from zoneinfo import ZoneInfo
 import requests
 import yaml
 
+import tender_db
+
 TZ = ZoneInfo("Asia/Taipei")
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -390,7 +392,7 @@ def build_text(items: list[dict], run_date: str, limit: int = 15) -> str:
     return text[:4900]
 
 
-def send_email(subject: str, html: str, text: str) -> None:
+def send_email(subject: str, html: str, text: str, attachment: Path | None = None) -> None:
     host = os.environ.get("SMTP_HOST")
     to = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
     if not host or not to:
@@ -401,12 +403,19 @@ def send_email(subject: str, html: str, text: str) -> None:
     pwd = os.environ.get("SMTP_PASS", "")
     sender = os.environ.get("MAIL_FROM", user)
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = formataddr(("標案快報", sender))
     msg["To"] = ", ".join(to)
-    msg.attach(MIMEText(text, "plain", "utf-8"))
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(text, "plain", "utf-8"))
+    alt.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(alt)
+    if attachment and attachment.exists():
+        from email.mime.application import MIMEApplication
+        part = MIMEApplication(attachment.read_bytes(), Name=attachment.name)
+        part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", attachment.name))
+        msg.attach(part)
 
     if port == 465:
         s = smtplib.SMTP_SSL(host, port, timeout=30)
@@ -465,12 +474,46 @@ def write_report(items: list[dict], run_date: str) -> None:
     (REPORT_DIR / f"{run_date}.md").write_text("\n".join(lines) + "\n", "utf-8")
 
 
+# ---------------------------------------------------------------- 資料庫
+def save_db(recs: list[dict], cfg: dict, now: datetime) -> tuple[int, int]:
+    def url_fn(r, m):
+        if not r.get("pk"):
+            return TODAY_URL
+        return (f"{PCC}/prkms/urlSelector/common/tpam?pk={r['pk']}" if r.get("source") == "search"
+                else DETAIL_URL.format(pk=r["pk"]))
+    return tender_db.upsert(recs, lambda r: match_record(r, cfg), url_fn,
+                            lambda r: parse_money(r.get("budget_text", "")), now)
+
+
+def backfill(cfg: dict, now: datetime, days: int, cate: str) -> int:
+    """逐日回補資料庫；遇驗證碼即停止並保存已取得的部分。"""
+    total = 0
+    for i in range(days):
+        d = now - timedelta(days=i)
+        try:
+            recs = fetch_search(d, d, cate)
+        except CaptchaBlocked:
+            print(f"⚠️  {d:%m/%d} 遇驗證碼，停止回補（已保存 {total} 筆）")
+            break
+        added, updated = save_db(recs, cfg, now)
+        total += len(recs)
+        print(f"🗄  {d:%Y-%m-%d} {len(recs)} 筆（新增 {added}、更新 {updated}）")
+        if not FIXTURE_DIR:
+            time.sleep(8)
+    tender_db.build_xlsx(now)
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::notice title=資料庫回補::{days} 天，共 {total} 筆")
+    return 0
+
+
 # ---------------------------------------------------------------- 主程式
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "config.yml"))
     ap.add_argument("--dry-run", action="store_true", help="不寄送、不寫入狀態")
     ap.add_argument("--ignore-seen", action="store_true", help="忽略已通知紀錄（測試用）")
+    ap.add_argument("--db-only", action="store_true", help="只更新資料庫與 Excel，不寄送、不標記已通知")
+    ap.add_argument("--days", type=int, help="查詢天數（覆蓋 config；回補資料庫用，逐日查詢）")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text("utf-8"))
@@ -480,19 +523,30 @@ def main() -> int:
     is_weekend = now.weekday() >= 5
 
     seen = {} if args.ignore_seen else load_seen()
-    lookback = max(1, int(opts.get("lookback_days", 3)))
+    lookback = max(1, int(args.days or opts.get("lookback_days", 3)))
     start = now - timedelta(days=lookback - 1)
+    cate = opts.get("category", "勞務類")
     source_note = ""
+    if args.db_only and args.days:
+        return backfill(cfg, now, lookback, cate)
     try:
-        recs = fetch_search(start, now, opts.get("category", "勞務類"))
+        recs = fetch_search(start, now, cate)
         source = "search"
-        source_note = f"標案查詢（{opts.get('category', '勞務類')}，{start:%m/%d}–{now:%m/%d}）"
+        source_note = f"標案查詢（{cate}，{start:%m/%d}–{now:%m/%d}）"
     except Exception as e:  # noqa: BLE001  — 查詢頁失敗時改用今日招標頁
         print(f"⚠️  標案查詢失敗（{type(e).__name__}: {e}），改用今日招標頁")
         recs = fetch_today()
         source = "today"
         source_note = f"今日招標（{now:%m/%d}，查詢頁失敗備援）"
     print(f"📥 {source_note} {len(recs)} 筆")
+
+    xlsx = None
+    if not args.dry_run:
+        added, updated = save_db(recs, cfg, now)
+        xlsx = tender_db.build_xlsx(now)
+        print(f"🗄  資料庫：新增 {added}、更新 {updated} 筆")
+        if args.db_only:
+            return 0
 
     candidates = {}
     for rec in recs:
@@ -561,7 +615,7 @@ def main() -> int:
     if items or send_empty:
         subject = f"【標案快報】{run_date} 新案 {len(items)} 件" + (
             f"｜{items[0]['title'][:20]}…" if items else "")
-        send_email(subject, html, text)
+        send_email(subject, html, text, xlsx if opts.get("attach_excel", True) else None)
         if items or opts.get("line_when_empty", False):
             send_line(text)
     else:
