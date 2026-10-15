@@ -13,6 +13,9 @@ on:
       db_only:
         description: "只更新資料庫與 Excel，不寄信（true/false）"
         default: "false"
+      sync_all:
+        description: "把資料庫全部同步到雲端試算表（初次/重建用，true/false）"
+        default: "false"
       days:
         description: "回補天數（搭配 db_only=true，逐日查詢；留空=依 config）"
         default: ""
@@ -48,10 +51,13 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.db_only }}" = "true" ]; then ARGS="$ARGS --db-only"; fi
+          if [ "${{ github.event.inputs.sync_all }}" = "true" ]; then ARGS="--sync-all"; fi
           if [ -n "${{ github.event.inputs.days }}" ]; then ARGS="$ARGS --days ${{ github.event.inputs.days }}"; fi
           python tender_alert.py $ARGS
 

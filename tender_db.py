@@ -23,6 +23,15 @@ def row_key(r: dict) -> str:
     return f"{r['unit_name']}|{r['job_number']}|{r.get('seq') or '01'}|{r['type']}"
 
 
+def _roc_to_iso(s: str) -> str:
+    """'115/10/20 17:00' → '2026-10-20 17:00'（方便排序，也避免試算表誤判）"""
+    import re
+    m = re.match(r"\s*(\d{2,3})/(\d{1,2})/(\d{1,2})(.*)", s or "")
+    if not m:
+        return s or ""
+    return f"{int(m[1]) + 1911}-{int(m[2]):02d}-{int(m[3]):02d}{m[4].rstrip()}"
+
+
 def _to_row(r: dict, m: dict | None, stamp: str, url: str, budget) -> dict:
     d = r.get("date") or ""
     return {
@@ -35,7 +44,7 @@ def _to_row(r: dict, m: dict | None, stamp: str, url: str, budget) -> dict:
         "傳輸次數": r.get("seq", ""),
         "採購性質": r.get("category", ""),
         "預算": "" if budget is None else budget,
-        "截止投標": r.get("deadline_list", ""),
+        "截止投標": _roc_to_iso(r.get("deadline_list", "")),
         "符合": "Y" if m else "",
         "關鍵字群組": "/".join(m["groups"]) if m else "",
         "命中關鍵字": "、".join(m["keywords"]) if m else "",
@@ -51,7 +60,10 @@ def _load(path: Path) -> dict[str, dict]:
     if not path.exists():
         return {}
     with path.open(encoding="utf-8-sig", newline="") as f:
-        return {row["主鍵"]: row for row in csv.DictReader(f)}
+        rows = {row["主鍵"]: row for row in csv.DictReader(f)}
+    for row in rows.values():  # 舊資料民國日期 → 西元
+        row["截止投標"] = _roc_to_iso(row.get("截止投標", ""))
+    return rows
 
 
 def _save(path: Path, rows: dict[str, dict]) -> None:
@@ -63,8 +75,9 @@ def _save(path: Path, rows: dict[str, dict]) -> None:
         w.writerows(ordered)
 
 
-def upsert(recs: list[dict], match_fn, url_fn, budget_fn, now: datetime) -> tuple[int, int]:
-    """寫入資料庫；回傳 (新增筆數, 更新筆數)。"""
+def upsert(recs: list[dict], match_fn, url_fn, budget_fn, now: datetime) -> tuple[int, int, list[dict]]:
+    """寫入資料庫；回傳 (新增筆數, 更新筆數, 新增或變動的列)。"""
+    changed: list[dict] = []
     stamp = now.strftime("%Y-%m-%d %H:%M")
     by_month: dict[str, list[dict]] = defaultdict(list)
     for r in recs:
@@ -89,11 +102,13 @@ def upsert(recs: list[dict], match_fn, url_fn, budget_fn, now: datetime) -> tupl
                 if any(str(new[c]) != str(old.get(c, "")) for c in FIELDS if c not in ("最後更新", "首次收錄")):
                     db[k] = new
                     updated += 1
+                    changed.append(new)
             else:
                 db[k] = new
                 added += 1
+                changed.append(new)
         _save(path, db)
-    return added, updated
+    return added, updated, changed
 
 
 def load_all() -> list[dict]:

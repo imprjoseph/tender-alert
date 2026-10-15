@@ -475,14 +475,57 @@ def write_report(items: list[dict], run_date: str) -> None:
 
 
 # ---------------------------------------------------------------- 資料庫
+PENDING_FILE = DATA_DIR / "sheet_pending.json"
+
+
+def push_sheet(rows: list[dict]) -> bool:
+    """把新增／變動的列送到 Google Sheet（Apps Script Web App）。失敗的列存起來下次重送。"""
+    url, token = os.environ.get("GAS_URL"), os.environ.get("GAS_TOKEN")
+    pending = json.loads(PENDING_FILE.read_text("utf-8")) if PENDING_FILE.exists() else []
+    if not url or not token:
+        if rows:
+            print("ℹ️  未設定 GAS_URL / GAS_TOKEN，略過雲端試算表同步")
+        return False
+    merged = {r["主鍵"]: r for r in pending}
+    merged.update({r["主鍵"]: r for r in rows})
+    allrows = list(merged.values())
+    if not allrows:
+        return True
+    failed, added, updated = [], 0, 0
+    for i in range(0, len(allrows), 800):
+        chunk = allrows[i:i + 800]
+        try:
+            r = requests.post(url, json={"token": token, "rows": chunk}, timeout=300)
+            res = r.json()
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error"))
+            added += res["all"]["added"]
+            updated += res["all"]["updated"]
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  試算表同步失敗（{type(e).__name__}: {str(e)[:200]}），{len(chunk)} 筆下次重送")
+            failed.extend(chunk)
+    DATA_DIR.mkdir(exist_ok=True)
+    if failed:
+        PENDING_FILE.write_text(json.dumps(failed, ensure_ascii=False), "utf-8")
+    elif PENDING_FILE.exists():
+        PENDING_FILE.unlink()
+    msg = f"雲端試算表：新增 {added}、更新 {updated}" + (f"，{len(failed)} 筆待重送" if failed else "")
+    print(f"☁️  {msg}")
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::{'warning' if failed else 'notice'} title=雲端試算表::{msg}")
+    return not failed
+
+
 def save_db(recs: list[dict], cfg: dict, now: datetime) -> tuple[int, int]:
     def url_fn(r, m):
         if not r.get("pk"):
             return TODAY_URL
         return (f"{PCC}/prkms/urlSelector/common/tpam?pk={r['pk']}" if r.get("source") == "search"
                 else DETAIL_URL.format(pk=r["pk"]))
-    return tender_db.upsert(recs, lambda r: match_record(r, cfg), url_fn,
-                            lambda r: parse_money(r.get("budget_text", "")), now)
+    added, updated, changed = tender_db.upsert(recs, lambda r: match_record(r, cfg), url_fn,
+                                               lambda r: parse_money(r.get("budget_text", "")), now)
+    push_sheet(changed)
+    return added, updated
 
 
 def backfill(cfg: dict, now: datetime, days: int, cate: str) -> int:
@@ -513,6 +556,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="不寄送、不寫入狀態")
     ap.add_argument("--ignore-seen", action="store_true", help="忽略已通知紀錄（測試用）")
     ap.add_argument("--db-only", action="store_true", help="只更新資料庫與 Excel，不寄送、不標記已通知")
+    ap.add_argument("--sync-all", action="store_true", help="把資料庫全部資料同步到雲端試算表（初次或重建用）")
     ap.add_argument("--days", type=int, help="查詢天數（覆蓋 config；回補資料庫用，逐日查詢）")
     args = ap.parse_args()
 
@@ -521,6 +565,11 @@ def main() -> int:
     now = datetime.now(TZ)
     run_date = now.strftime("%Y-%m-%d")
     is_weekend = now.weekday() >= 5
+
+    if args.sync_all:
+        rows = tender_db.load_all()
+        print(f"☁️  全部同步 {len(rows)} 筆")
+        return 0 if push_sheet(rows) else 1
 
     seen = {} if args.ignore_seen else load_seen()
     lookback = max(1, int(args.days or opts.get("lookback_days", 3)))
