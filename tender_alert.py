@@ -480,6 +480,8 @@ def main() -> int:
         print(f"\n(dry-run) Email 預覽已存到 preview.html\n---- LINE 預覽 ----\n{text}")
         return 0
 
+    if not os.environ.get("SMTP_HOST") and not os.environ.get("LINE_CHANNEL_TOKEN"):
+        raise RuntimeError("尚未設定寄送管道：請在 GitHub Settings → Secrets → Actions 設定 SMTP_HOST 等 Email 參數")
     send_empty = opts.get("send_when_empty", True) and not is_weekend
     if items or send_empty:
         subject = f"【標案快報】{run_date} 新案 {len(items)} 件" + (
