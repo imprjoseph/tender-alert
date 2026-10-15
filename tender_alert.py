@@ -116,9 +116,6 @@ def _field(flat: str, label: str) -> str:
     return _text(m.group(1)) if m else ""
 
 
-_detail_debug_done = False
-
-
 def _parse_detail(html: str) -> dict:
     flat = re.sub(r"\s+", " ", html)
     d = {
@@ -135,33 +132,26 @@ def _parse_detail(html: str) -> dict:
     return d
 
 
+class CaptchaBlocked(Exception):
+    pass
+
+
 def fetch_detail(pk: str) -> dict:
-    global _detail_debug_done
+    """抓明細頁。採購網對短時間大量查詢會要求驗證碼；遇到即停止，不重試、不繞過。"""
     url = DETAIL_URL.format(pk=pk)
     if FIXTURE_DIR:
         html = _get_html(url, f"detail_{pk}.html")
+        if "驗證碼檢核" in html:
+            raise CaptchaBlocked()
         return _parse_detail(html) if html else {}
-    last = ""
-    for attempt in range(3):
-        try:
-            r = _session.get(url, timeout=40, headers={"Referer": TODAY_URL})
-            r.encoding = "utf-8"
-            d = _parse_detail(r.text)
-            if d["category"] or d["deadline"]:
-                return d
-            t = re.search(r"<title>(.*?)</title>", r.text, re.S)
-            clean = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", r.text, flags=re.S | re.I)
-            body = _text(clean)
-            key = re.search(r".{0,120}(驗證|查無|錯誤|逾時|不存在|權限|稍後|Error|error).{0,200}", body)
-            last = (f"HTTP {r.status_code} len={len(r.text)} url={r.url} "
-                    f"msg={key.group(0) if key else body[-300:]}")
-        except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {e}"
-        time.sleep(5 * (attempt + 1))
-    if os.environ.get("GITHUB_ACTIONS") and not _detail_debug_done:
-        print(f"::notice title=明細頁失敗樣本::{pk} {last}"[:900])
-        _detail_debug_done = True
-    return {}
+    try:
+        r = _session.get(url, timeout=40, headers={"Referer": TODAY_URL})
+        r.encoding = "utf-8"
+    except Exception:  # noqa: BLE001
+        return {}
+    if "驗證碼檢核" in r.text:
+        raise CaptchaBlocked()
+    return _parse_detail(r.text)
 
 
 # ---------------------------------------------------------------- 篩選
@@ -226,9 +216,8 @@ def parse_money(s: str) -> int | None:
     return int(m[0].replace(",", "")) if m else None
 
 
-def enrich(item: dict, now: datetime, cfg: dict) -> dict | None:
-    """抓明細並做二次過濾；回傳 None 表示被濾掉。"""
-    d = fetch_detail(item["pk"]) if item["pk"] else {}
+def enrich(item: dict, now: datetime, cfg: dict, d: dict) -> dict:
+    """套用明細（可能為空）並做二次過濾；被濾掉者標記 _drop。"""
     item["detail_ok"] = bool(d.get("category") or d.get("deadline"))
     f = cfg["filters"]
     item["category"] = d.get("category", "")
@@ -444,13 +433,21 @@ def main() -> int:
     items = []
     bmin, bmax = opts.get("budget_min"), opts.get("budget_max")
     drop = {"分類": 0, "預算": 0, "過期": 0}
-    detail_fail = 0
-    for it in candidates.values():
-        it = enrich(it, now, cfg)
-        if not FIXTURE_DIR:
-            time.sleep(2)
-        if not it.get("detail_ok"):
-            detail_fail += 1
+    max_detail = int(opts.get("max_detail", 4))
+    ranked = sorted(candidates.values(), key=lambda x: -x["score"])
+    detail_ok, blocked = 0, False
+    for n, it in enumerate(ranked):
+        d = {}
+        if n < max_detail and it["pk"] and not blocked:
+            try:
+                d = fetch_detail(it["pk"])
+                detail_ok += bool(d)
+            except CaptchaBlocked:
+                blocked = True
+                print("⚠️  採購網要求驗證碼，停止抓取明細（其餘案件不含預算/分類）")
+            if not FIXTURE_DIR:
+                time.sleep(3)
+        it = enrich(it, now, cfg, d)
         if it.get("_drop"):
             drop[it["_drop"]] += 1
             continue
@@ -466,12 +463,11 @@ def main() -> int:
     items.sort(key=lambda x: (-x["score"], x["days_left"] if x.get("days_left") is not None else 999))
     stats = {"scanned": len(recs), "dates": now.strftime("%m/%d")}
 
-    print(f"✅ 最終符合 {len(items)} 件（排除 {drop}，明細失敗 {detail_fail}）")
-    if detail_fail and detail_fail == len(candidates) and os.environ.get("GITHUB_ACTIONS"):
-        print("::warning title=明細頁::全部明細頁抓取失敗，分類/預算過濾未生效")
+    print(f"✅ 最終符合 {len(items)} 件（排除 {drop}，明細 {detail_ok} 件{'，遇驗證碼停止' if blocked else ''}）")
     if os.environ.get("GITHUB_ACTIONS"):
         print(f"::notice title=標案快報::今日 {len(recs)} 筆，初篩 {len(candidates)} 件，"
-              f"排除 分類{drop['分類']}/預算{drop['預算']}/過期{drop['過期']}，明細失敗 {detail_fail}，最終 {len(items)} 件"
+              f"排除 分類{drop['分類']}/預算{drop['預算']}/過期{drop['過期']}，明細 {detail_ok} 件"
+              f"{'（遇驗證碼停止）' if blocked else ''}，最終 {len(items)} 件"
               + ("｜" + "；".join(i['title'][:25] for i in items[:5]) if items else ""))
     for it in items:
         print(f"  [{it['score']}] {it['title']}｜{it['unit_name']}｜{fmt_money(it.get('budget'))}"
