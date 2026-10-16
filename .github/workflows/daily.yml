@@ -2,9 +2,9 @@ name: 每日標案快報
 
 on:
   schedule:
-    # 每天 台灣時間 07:23（UTC 前一天 23:23）。資料來源為「今日招標」頁，需每天執行才不漏案
-    # 週末若無新案不寄信；GitHub 排程尖峰可能延遲 5–30 分鐘
-    - cron: "23 23 * * *"
+    # 每天 台灣時間 06:07（UTC 前一天 22:07）。GitHub 排程常延遲 1–2 小時，提早排確保上班前收到
+    # 週末若無新案不寄信
+    - cron: "7 22 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,6 +12,12 @@ on:
         default: "false"
       db_only:
         description: "只更新資料庫與 Excel，不寄信（true/false）"
+        default: "false"
+      rescore:
+        description: "依目前 config.yml 重新標記資料庫並同步（改關鍵字後用，true/false）"
+        default: "false"
+      ignore_seen:
+        description: "重寄所有仍在投標期限內的符合案件（true/false）"
         default: "false"
       sync_all:
         description: "把資料庫全部同步到雲端試算表（初次/重建用，true/false）"
@@ -57,7 +63,9 @@ jobs:
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.db_only }}" = "true" ]; then ARGS="$ARGS --db-only"; fi
+          if [ "${{ github.event.inputs.ignore_seen }}" = "true" ]; then ARGS="$ARGS --ignore-seen"; fi
           if [ "${{ github.event.inputs.sync_all }}" = "true" ]; then ARGS="--sync-all"; fi
+          if [ "${{ github.event.inputs.rescore }}" = "true" ]; then ARGS="--rescore"; fi
           if [ -n "${{ github.event.inputs.days }}" ]; then ARGS="$ARGS --days ${{ github.event.inputs.days }}"; fi
           python tender_alert.py $ARGS
 

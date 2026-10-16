@@ -32,8 +32,10 @@ function doPost(e) {
   try {
     const rows = body.rows || [];
     const all = upsert_('全部公告', ALL_COLS, [], rows);
-    const hits = upsert_('符合案件', HIT_COLS, HIT_EXTRA,
-      rows.filter(r => r['符合'] === 'Y' && String(r['公告類型']).indexOf('更正') < 0));
+    const isHit = r => r['符合'] === 'Y' && String(r['公告類型']).indexOf('更正') < 0;
+    const hits = upsert_('符合案件', HIT_COLS, HIT_EXTRA, rows.filter(isHit));
+    hits.removed = removeRows_('符合案件', HIT_COLS.length, HIT_EXTRA.length,
+      rows.filter(r => !isHit(r)).map(r => String(r['主鍵'])));
     writeInfo_();
     return json_({ ok: true, all: all, hits: hits });
   } catch (err) {
@@ -91,6 +93,23 @@ function upsert_(name, cols, extra, rows) {
     if (extra.length) sh.getRange(2, width + 1, toAdd.length, extra.length).clearContent();
   }
   return { added: toAdd.length, updated: updated };
+}
+
+/** 關鍵字規則調整後不再符合的列：若同仁未填任何備註欄，就從「符合案件」移除 */
+function removeRows_(name, width, extraLen, keys) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(name);
+  if (!sh || !keys.length || sh.getLastRow() < 2) return 0;
+  const drop = {};
+  keys.forEach(k => { drop[k] = true; });
+  const n = sh.getLastRow() - 1;
+  const data = sh.getRange(2, 1, n, width + extraLen).getValues();
+  const targets = [];
+  data.forEach((row, i) => {
+    const annotated = row.slice(width).some(v => String(v).trim() !== '');
+    if (drop[String(row[0])] && !annotated) targets.push(i + 2);
+  });
+  for (let i = targets.length - 1; i >= 0; i--) sh.deleteRow(targets[i]);  // 由下往上刪
+  return targets.length;
 }
 
 function cell_(col, v) {

@@ -231,19 +231,33 @@ def match_record(rec: dict, cfg: dict) -> dict | None:
     if contains_any(title, f.get("title_exclude", [])):
         return None
 
+    quals = contains_any(title, cfg.get("qualifiers", []))
+    # 先收集所有群組的 weak 命中，判斷是否「2 個以上不同 weak 詞」
+    weak_all, strict_all = set(), set()
+    for g in cfg["keyword_groups"]:
+        if not contains_any(title, g.get("exclude", [])):
+            weak_all.update(contains_any(title, g.get("weak", [])))
+            strict_all.update(contains_any(title, g.get("weak_strict", [])))
+    multi = len(weak_all | strict_all) >= 2
+    weak_ok = bool(quals) or multi      # weak：有限定詞，或 2 個以上泛用詞
+    strict_ok = multi                   # weak_strict：一定要 2 個以上泛用詞
+
     groups_hit, kw_hit, score = [], [], 0
     for g in cfg["keyword_groups"]:
-        hits = contains_any(title, g.get("keywords", []))
+        if contains_any(title, g.get("exclude", [])):
+            continue
+        strong = contains_any(title, g.get("strong", []) + g.get("keywords", []))
         if g.get("search_unit_name"):
-            hits += contains_any(unit, g.get("keywords", []))
-        if hits and contains_any(title, g.get("exclude", [])):
-            hits = []
-        if hits and g.get("must_also") and not contains_any(title, g["must_also"]):
-            hits = []
-        if hits:
+            strong += contains_any(unit, g.get("strong", []) + g.get("keywords", []))
+        weak = (contains_any(title, g.get("weak", [])) if weak_ok else []) + \
+               (contains_any(title, g.get("weak_strict", [])) if strict_ok else [])
+        weak = [w for w in weak if not any(w in sw for sw in strong)]  # 已被 strong 涵蓋的不重複計分
+        if g.get("must_also") and not contains_any(title, g["must_also"]):
+            strong, weak = [], []
+        if strong or weak:
             groups_hit.append(g["name"])
-            kw_hit += hits
-            score += g.get("priority", 1) * len(set(hits))
+            kw_hit += strong + weak
+            score += g.get("priority", 1) * (2 * len(set(strong)) + len(set(weak)))
     if not groups_hit:
         return None
 
@@ -395,6 +409,7 @@ def build_text(items: list[dict], run_date: str, limit: int = 15) -> str:
 def send_email(subject: str, html: str, text: str, attachment: Path | None = None) -> None:
     host = os.environ.get("SMTP_HOST")
     to = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
+    to += [a for a in EXTRA_TO if a not in to]
     if not host or not to:
         print("ℹ️  未設定 SMTP_HOST / MAIL_TO，略過 Email")
         return
@@ -476,6 +491,7 @@ def write_report(items: list[dict], run_date: str) -> None:
 
 # ---------------------------------------------------------------- 資料庫
 PENDING_FILE = DATA_DIR / "sheet_pending.json"
+EXTRA_TO: list[str] = []
 
 
 def push_sheet(rows: list[dict]) -> bool:
@@ -561,15 +577,26 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="不寄送、不寫入狀態")
     ap.add_argument("--ignore-seen", action="store_true", help="忽略已通知紀錄（測試用）")
     ap.add_argument("--db-only", action="store_true", help="只更新資料庫與 Excel，不寄送、不標記已通知")
+    ap.add_argument("--rescore", action="store_true", help="以目前 config.yml 重新標記資料庫全部「符合」並同步")
     ap.add_argument("--sync-all", action="store_true", help="把資料庫全部資料同步到雲端試算表（初次或重建用）")
     ap.add_argument("--days", type=int, help="查詢天數（覆蓋 config；回補資料庫用，逐日查詢）")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text("utf-8"))
     opts = cfg.get("options", {})
+    EXTRA_TO.extend(opts.get("extra_recipients") or [])
     now = datetime.now(TZ)
     run_date = now.strftime("%Y-%m-%d")
     is_weekend = now.weekday() >= 5
+
+    if args.rescore:
+        n, changed = tender_db.rescore(lambda r: match_record(r, cfg), now)
+        tender_db.build_xlsx(now)
+        print(f"🔁 重新標記：{n} 筆中 {len(changed)} 筆變動")
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::notice title=重新標記::{len(changed)} 筆變動")
+        push_sheet(changed)
+        return 0
 
     if args.sync_all:
         rows = tender_db.load_all()

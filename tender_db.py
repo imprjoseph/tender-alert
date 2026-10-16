@@ -215,3 +215,27 @@ def build_xlsx(now: datetime, recent_days: int = 30) -> Path | None:
     XLSX.parent.mkdir(parents=True, exist_ok=True)
     wb.save(XLSX)
     return XLSX
+
+
+def rescore(match_fn, now: datetime) -> tuple[int, list[dict]]:
+    """依目前關鍵字規則重新標記所有資料的「符合」欄；回傳 (總筆數, 有變動的列)。"""
+    stamp = now.strftime("%Y-%m-%d %H:%M")
+    total, changed = 0, []
+    for path in sorted(DB_DIR.glob("*.csv")):
+        db = _load(path)
+        for k, row in db.items():
+            total += 1
+            rec = {"type": row["公告類型"], "title": row["案名"], "unit_name": row["機關"], "pk": ""}
+            m = match_fn(rec)
+            new = {
+                "符合": "Y" if m else "",
+                "關鍵字群組": "/".join(m["groups"]) if m else "",
+                "命中關鍵字": "、".join(m["keywords"]) if m else "",
+                "分數": m["score"] if m else "",
+            }
+            if any(str(new[c]) != str(row.get(c, "")) for c in new):
+                row.update(new)
+                row["最後更新"] = stamp
+                changed.append(row)
+        _save(path, db)
+    return total, changed
