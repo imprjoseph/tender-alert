@@ -2,17 +2,15 @@
  * 政府標案資料庫 — Google Apps Script 接收端
  * 綁定在 Google Sheet「政府標案資料庫（自動累積）」上（擴充功能 → Apps Script）
  *
- * GitHub Actions 每天把「新增或有變動」的公告 POST 過來，這裡負責 upsert：
- *   工作表「全部公告」：全部收錄的勞務類公告
- *   工作表「符合案件」：命中關鍵字者（不含更正公告），右側「狀態／負責人／是否投標／備註」
- *                       由同仁填寫，系統更新資料時不會覆蓋
+ * GitHub Actions 每天把「新增或有變動」的案件 POST 過來，這裡負責 upsert：
+ *   工作表「符合案件」：只收錄與本司業務相關的案件（符合關鍵字規則，不含更正公告）
+ *                       右側「狀態／負責人／是否投標／備註」由同仁填寫，系統更新時不會覆蓋
+ *   規則調整後不再符合的案件會自動移除（已填備註者保留）
  * 新資料插在最上方（最新在上）。主鍵欄（A 欄）隱藏，請勿刪除。
  */
 
 const TOKEN = '__GAS_TOKEN__';   // 必須與 GitHub Secret「GAS_TOKEN」相同
 
-const ALL_COLS = ['主鍵', '公告日', '機關', '案名', '預算', '截止投標', '公告類型', '傳輸次數',
-  '採購性質', '案號', '符合', '關鍵字群組', '命中關鍵字', '分數', '連結', '首次收錄', '最後更新', '資料來源'];
 const HIT_COLS = ['主鍵', '公告日', '機關', '案名', '預算', '截止投標', '公告類型', '案號',
   '關鍵字群組', '命中關鍵字', '分數', '連結', '首次收錄'];
 const HIT_EXTRA = ['狀態', '負責人', '是否投標', '備註'];
@@ -31,13 +29,15 @@ function doPost(e) {
   lock.waitLock(30000);
   try {
     const rows = body.rows || [];
-    const all = upsert_('全部公告', ALL_COLS, [], rows);
+    const ss = SpreadsheetApp.getActive();
+    const old = ss.getSheetByName('全部公告');           // 舊版的全量工作表，已不使用
+    if (old && ss.getSheets().length > 1) ss.deleteSheet(old);
     const isHit = r => r['符合'] === 'Y' && String(r['公告類型']).indexOf('更正') < 0;
     const hits = upsert_('符合案件', HIT_COLS, HIT_EXTRA, rows.filter(isHit));
     hits.removed = removeRows_('符合案件', HIT_COLS.length, HIT_EXTRA.length,
       rows.filter(r => !isHit(r)).map(r => String(r['主鍵'])));
     writeInfo_();
-    return json_({ ok: true, all: all, hits: hits });
+    return json_({ ok: true, hits: hits });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   } finally {
@@ -49,7 +49,7 @@ function doPost(e) {
 function doGet() {
   const ss = SpreadsheetApp.getActive();
   const n = name => { const s = ss.getSheetByName(name); return s ? Math.max(0, s.getLastRow() - 1) : 0; };
-  return json_({ ok: true, 全部公告: n('全部公告'), 符合案件: n('符合案件') });
+  return json_({ ok: true, 符合案件: n('符合案件'), 全部公告: n('全部公告') });
 }
 
 function upsert_(name, cols, extra, rows) {
@@ -158,7 +158,7 @@ function writeInfo_() {
   sh.getRange(1, 1, 8, 1).setValues([
     ['政府標案資料庫（由 GitHub Actions 每天自動更新）'],
     ['最後同步：' + Utilities.formatDate(new Date(), 'Asia/Taipei', 'yyyy-MM-dd HH:mm')],
-    ['全部公告：' + n('全部公告') + ' 筆　符合案件：' + n('符合案件') + ' 筆'],
+    ['符合案件：' + n('符合案件') + ' 筆（只收錄與本司業務相關的案件）'],
     ['資料來源：政府電子採購網「標案查詢」（採購性質與關鍵字設定見 GitHub repo 的 config.yml）'],
     ['「符合案件」右側橘色欄位（狀態／負責人／是否投標／備註）由同仁填寫，系統不會覆蓋'],
     ['請勿刪除或移動欄位、勿刪除隱藏的 A 欄（主鍵），可自由使用篩選、排序、建立篩選檢視'],

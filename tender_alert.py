@@ -512,7 +512,7 @@ def push_sheet(rows: list[dict]) -> bool:
         return False
     if not allrows:
         return True
-    failed, added, updated = [], 0, 0
+    failed, added, updated, removed = [], 0, 0, 0
     for i in range(0, len(allrows), 800):
         chunk = allrows[i:i + 800]
         try:
@@ -520,8 +520,10 @@ def push_sheet(rows: list[dict]) -> bool:
             res = r.json()
             if not res.get("ok"):
                 raise RuntimeError(res.get("error"))
-            added += res["all"]["added"]
-            updated += res["all"]["updated"]
+            h = res.get("hits", {})
+            added += h.get("added", 0)
+            updated += h.get("updated", 0)
+            removed += h.get("removed", 0)
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  試算表同步失敗（{type(e).__name__}: {str(e)[:200]}），{len(chunk)} 筆下次重送")
             failed.extend(chunk)
@@ -530,7 +532,7 @@ def push_sheet(rows: list[dict]) -> bool:
         PENDING_FILE.write_text(json.dumps(failed, ensure_ascii=False), "utf-8")
     elif PENDING_FILE.exists():
         PENDING_FILE.unlink()
-    msg = f"雲端試算表：新增 {added}、更新 {updated}" + (f"，{len(failed)} 筆待重送" if failed else "")
+    msg = f"雲端試算表：新增 {added}、更新 {updated}、移除 {removed}" + (f"，{len(failed)} 筆待重送" if failed else "")
     print(f"☁️  {msg}")
     if os.environ.get("GITHUB_ACTIONS"):
         print(f"::{'warning' if failed else 'notice'} title=雲端試算表::{msg}")
@@ -543,8 +545,8 @@ def save_db(recs: list[dict], cfg: dict, now: datetime) -> tuple[int, int]:
             return TODAY_URL
         return (f"{PCC}/prkms/urlSelector/common/tpam?pk={r['pk']}" if r.get("source") == "search"
                 else DETAIL_URL.format(pk=r["pk"]))
-    added, updated, changed = tender_db.upsert(recs, lambda r: match_record(r, cfg), url_fn,
-                                               lambda r: parse_money(r.get("budget_text", "")), now)
+    added, updated, changed, removed = tender_db.upsert(recs, lambda r: match_record(r, cfg), url_fn,
+                                                        lambda r: parse_money(r.get("budget_text", "")), now)
     push_sheet(changed)
     return added, updated
 
@@ -590,11 +592,12 @@ def main() -> int:
     is_weekend = now.weekday() >= 5
 
     if args.rescore:
-        n, changed = tender_db.rescore(lambda r: match_record(r, cfg), now)
+        n, changed, (a, u, rm) = tender_db.rescore(lambda r: match_record(r, cfg), now)
         tender_db.build_xlsx(now)
-        print(f"🔁 重新標記：{n} 筆中 {len(changed)} 筆變動")
+        msg = f"重新篩選原始收錄 {n} 筆 → 資料庫新增 {a}、更新 {u}、移除 {rm}，現有 {len(tender_db.load_all())} 筆"
+        print(f"🔁 {msg}")
         if os.environ.get("GITHUB_ACTIONS"):
-            print(f"::notice title=重新標記::{len(changed)} 筆變動")
+            print(f"::notice title=重新篩選::{msg}")
         push_sheet(changed)
         return 0
 
@@ -625,7 +628,7 @@ def main() -> int:
     if not args.dry_run:
         added, updated = save_db(recs, cfg, now)
         xlsx = tender_db.build_xlsx(now)
-        print(f"🗄  資料庫：新增 {added}、更新 {updated} 筆")
+        print(f"🗄  標案資料庫：新增 {added}、更新 {updated} 筆（現有 {len(tender_db.load_all())} 筆）")
         if args.db_only:
             return 0
 
