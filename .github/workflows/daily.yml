@@ -5,6 +5,8 @@ on:
     # 每天 台灣時間 06:07（UTC 前一天 22:07）。GitHub 排程常延遲 1–2 小時，提早排確保上班前收到
     # 週末若無新案不寄信
     - cron: "7 22 * * *"
+    # 補跑：台灣時間 09:37。若早上那次已成功就自動略過；失敗（例如採購網暫時連不上）則重跑
+    - cron: "37 1 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -61,6 +63,7 @@ jobs:
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           ARGS=""
+          if [ "${{ github.event.schedule }}" = "37 1 * * *" ]; then ARGS="--if-not-done"; fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.db_only }}" = "true" ]; then ARGS="$ARGS --db-only"; fi
           if [ "${{ github.event.inputs.ignore_seen }}" = "true" ]; then ARGS="$ARGS --ignore-seen"; fi

@@ -63,7 +63,7 @@ def _get_html(url: str, fixture: str) -> str:
         f = Path(FIXTURE_DIR) / fixture
         return f.read_text("utf-8", errors="replace") if f.exists() else ""
     last_err = None
-    for attempt in range(4):
+    for attempt in range(6):
         try:
             r = _session.get(url, timeout=40)
             r.raise_for_status()
@@ -71,7 +71,7 @@ def _get_html(url: str, fixture: str) -> str:
             return r.text
         except Exception as e:  # noqa: BLE001
             last_err = e
-            time.sleep(4 * (attempt + 1))
+            time.sleep(min(90, 10 * (attempt + 1)))
     raise RuntimeError(f"採購網連線失敗：{url} → {last_err}")
 
 
@@ -409,7 +409,7 @@ def build_text(items: list[dict], run_date: str, limit: int = 15) -> str:
 def send_email(subject: str, html: str, text: str, attachment: Path | None = None) -> None:
     host = os.environ.get("SMTP_HOST")
     to = [a.strip() for a in os.environ.get("MAIL_TO", "").split(",") if a.strip()]
-    to += [a for a in EXTRA_TO if a not in to]
+    to = list(dict.fromkeys(to + EXTRA_TO))   # 去除重複
     if not host or not to:
         print("ℹ️  未設定 SMTP_HOST / MAIL_TO，略過 Email")
         return
@@ -436,7 +436,9 @@ def send_email(subject: str, html: str, text: str, attachment: Path | None = Non
         s = smtplib.SMTP_SSL(host, port, timeout=30)
     else:
         s = smtplib.SMTP(host, port, timeout=30)
-        s.starttls()
+        s.ehlo()
+        if s.has_extn("starttls"):
+            s.starttls()
     with s:
         if user:
             s.login(user, pwd)
@@ -491,6 +493,7 @@ def write_report(items: list[dict], run_date: str) -> None:
 
 # ---------------------------------------------------------------- 資料庫
 PENDING_FILE = DATA_DIR / "sheet_pending.json"
+LAST_OK = DATA_DIR / "last_success.txt"
 EXTRA_TO: list[str] = []
 
 
@@ -579,6 +582,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="不寄送、不寫入狀態")
     ap.add_argument("--ignore-seen", action="store_true", help="忽略已通知紀錄（測試用）")
     ap.add_argument("--db-only", action="store_true", help="只更新資料庫與 Excel，不寄送、不標記已通知")
+    ap.add_argument("--if-not-done", action="store_true", help="今天已成功寄出就跳過（補跑排程用）")
     ap.add_argument("--rescore", action="store_true", help="以目前 config.yml 重新標記資料庫全部「符合」並同步")
     ap.add_argument("--sync-all", action="store_true", help="把資料庫全部資料同步到雲端試算表（初次或重建用）")
     ap.add_argument("--days", type=int, help="查詢天數（覆蓋 config；回補資料庫用，逐日查詢）")
@@ -589,7 +593,9 @@ def main() -> int:
     EXTRA_TO.extend(opts.get("extra_recipients") or [])
     now = datetime.now(TZ)
     run_date = now.strftime("%Y-%m-%d")
-    is_weekend = now.weekday() >= 5
+    if args.if_not_done and LAST_OK.exists() and LAST_OK.read_text("utf-8").strip() == run_date:
+        print(f"✅ {run_date} 已成功寄出，補跑略過")
+        return 0
 
     if args.rescore:
         n, changed, (a, u, rm) = tender_db.rescore(lambda r: match_record(r, cfg), now)
@@ -695,7 +701,7 @@ def main() -> int:
 
     if not os.environ.get("SMTP_HOST") and not os.environ.get("LINE_CHANNEL_TOKEN"):
         raise RuntimeError("尚未設定寄送管道：請在 GitHub Settings → Secrets → Actions 設定 SMTP_HOST 等 Email 參數")
-    send_empty = opts.get("send_when_empty", True) and not is_weekend
+    send_empty = opts.get("send_when_empty", True)
     if items or send_empty:
         subject = f"【標案快報】{run_date} 新案 {len(items)} 件" + (
             f"｜{items[0]['title'][:20]}…" if items else "")
@@ -703,8 +709,9 @@ def main() -> int:
         if items or opts.get("line_when_empty", False):
             send_line(text)
     else:
-        print("ℹ️  無新案（週末不寄空報）")
+        print("ℹ️  無新案（send_when_empty: false，不寄空報）")
 
+    LAST_OK.write_text(run_date, "utf-8")
     stamp = now.strftime("%Y%m%d")
     for k in candidates:          # 含被分類／預算／過期濾掉者，避免每天重抓明細
         seen.setdefault(k, stamp)
@@ -721,7 +728,30 @@ if __name__ == "__main__":
     except Exception as e:  # noqa: BLE001
         import traceback
         print(traceback.format_exc())
+        msg = f"{type(e).__name__}: {e}"[:900].replace("\n", " ")
         if os.environ.get("GITHUB_ACTIONS"):
-            msg = f"{type(e).__name__}: {e}"[:900].replace("\n", " ")
             print(f"::error title=標案快報執行失敗::{msg}")
+        if "--dry-run" not in sys.argv and os.environ.get("SMTP_HOST"):
+            try:
+                try:
+                    _cfg = yaml.safe_load((ROOT / "config.yml").read_text("utf-8")) or {}
+                    EXTRA_TO.extend(_cfg.get("options", {}).get("extra_recipients") or [])
+                except Exception:  # noqa: BLE001
+                    pass
+                now = datetime.now(TZ)
+                retry = "系統將於 09:37 自動重試一次；重試成功會再寄出正常快報。" if now.hour < 9 or (now.hour == 9 and now.minute < 30) \
+                    else "今日自動重試也未成功，請稍後到 GitHub Actions 手動執行，或通知管理者。"
+                run_url = ""
+                if os.environ.get("GITHUB_RUN_ID"):
+                    run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+                               f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+                text = (f"標案快報 {now:%Y-%m-%d %H:%M} 執行失敗，今日快報未產生。\n\n原因：{msg}\n\n{retry}\n"
+                        + (f"\n執行紀錄：{run_url}\n" if run_url else ""))
+                html = ("<div style=\"font-family:'Microsoft JhengHei',Arial,sans-serif;max-width:640px\">"
+                        f"<h2 style=\"color:#b91c1c\">⚠️ 標案快報執行失敗</h2><p>{escape(now.strftime('%Y-%m-%d %H:%M'))}，今日快報未產生。</p>"
+                        f"<p><b>原因：</b>{escape(msg)}</p><p>{escape(retry)}</p>"
+                        + (f"<p><a href=\"{escape(run_url)}\">查看執行紀錄</a></p>" if run_url else "") + "</div>")
+                send_email(f"【標案快報】⚠️ 執行失敗 {now:%Y-%m-%d}", html, text)
+            except Exception as e2:  # noqa: BLE001
+                print(f"⚠️  失敗通知信也寄送失敗：{e2}")
         sys.exit(1)

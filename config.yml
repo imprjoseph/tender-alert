@@ -11,7 +11,7 @@ options:
   budget_max: 0             # 預算上限（元），0 = 不限
   max_detail: 4             # 僅在查詢頁失敗、改用今日招標頁時使用：抓前 N 件明細補預算（勿調高，會觸發驗證碼）
   skip_expired: true        # 已過截止投標日的不通知
-  send_when_empty: true     # 平日沒有新案也寄 Email（確認系統有在跑）；週末只在有新案時寄
+  send_when_empty: true     # 沒有新案也寄 Email（每天都寄，含週末，確認系統正常）
   line_when_empty: false    # 沒有新案時不推 LINE（避免打擾）
   extra_recipients:         # 除了 GitHub Secret MAIL_TO 之外，另外寄送的信箱
     - chengi.joseph@gmail.com
