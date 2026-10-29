@@ -66,12 +66,16 @@ jobs:
           $root = Join-Path $env:RUNNER_TOOL_CACHE "py312"
           $py = Join-Path $root "python.exe"
           if (-not (Test-Path $py)) {
-            Write-Output "Installing Python 3.12 into $root"
+            Write-Output "Installing portable Python 3.12 (python.org NuGet package) into $root"
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $exe = Join-Path $env:RUNNER_TEMP "python-3.12.10-amd64.exe"
-            Invoke-WebRequest "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile $exe -UseBasicParsing
-            $p = Start-Process $exe -ArgumentList "/quiet","InstallAllUsers=0","TargetDir=$root","PrependPath=0","Include_test=0","Include_launcher=0","Include_doc=0","Shortcuts=0","AssociateFiles=0","Include_pip=1" -Wait -PassThru
-            Write-Output "installer exit code: $($p.ExitCode)"
+            $pkg = Join-Path $env:RUNNER_TEMP "python312.zip"
+            Invoke-WebRequest "https://www.nuget.org/api/v2/package/python/3.12.10" -OutFile $pkg -UseBasicParsing
+            $tmp = Join-Path $env:RUNNER_TEMP "python312"
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            Expand-Archive -Path $pkg -DestinationPath $tmp -Force
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+            Copy-Item -Path (Join-Path $tmp "tools\*") -Destination $root -Recurse -Force
+            & $py -m ensurepip --upgrade
           }
           if (-not (Test-Path $py)) { Write-Output "::error title=python::install failed at $root"; exit 1 }
           & $py --version
