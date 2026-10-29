@@ -17,6 +17,12 @@ options:
     - chengi.joseph@gmail.com
   attach_excel: true        # Email 附上「標案資料庫.xlsx」（累積全部資料）
 
+# AI 模型：以同仁過去人工挑選的標案訓練（train_model.py → model.json）
+# 關鍵字規則「或」模型推薦度 ≥ threshold 任一成立即通知；模型不受 title_exclude／unit_exclude 限制
+model:
+  enabled: true
+  threshold: 0.9            # 調高 → 更精準但可能漏；調低 → 更多案件
+
 filters:
   # ① 公告類型：只看「還能投」的公告
   type_include:

@@ -94,6 +94,16 @@ Google 帳戶 → 安全性 → 開啟兩步驟驗證 → 「應用程式密碼�
 
 ---
 
+## AI 推薦（以同仁過去挑選紀錄訓練）
+
+除了關鍵字規則，另有一個以同仁過去人工挑選的 1,986 筆標案訓練的評分模型（`model.json`）。
+**關鍵字規則或 AI 推薦度 ≥ 門檻（config.yml `model.threshold`，預設 0.9）任一成立即通知**，
+快報與資料庫的「關鍵字群組」會標示「AI推薦0.94」這類推薦度。
+
+- 交叉驗證：規則單獨抓到同仁過去挑選的 51%；規則＋模型約 80%，每日件數相近
+- 重新訓練（例如累積更多挑選紀錄後）：`pip install scikit-learn numpy` → `python train_model.py` → commit `model.json`
+- 匯入人工整理的歷史 Excel：`python tender_import.py 檔案1.xlsx 檔案2.xlsx ...`
+
 ## 雲端資料庫（Google Sheet）
 
 每次執行後，新增或有變動的公告會自動寫入 Google Sheet「政府標案資料庫（自動累積）」，一直累積：

@@ -216,8 +216,33 @@ def contains_any(text: str, words: list[str]) -> list[str]:
     return [w for w in words or [] if w and w in (text or "")]
 
 
-def match_record(rec: dict, cfg: dict) -> dict | None:
-    """初篩：只用清單頁就有的欄位（類型、機關、案名）。"""
+_MODEL: dict | None = None
+_MODEL_LOADED = False
+
+
+def _model() -> dict | None:
+    global _MODEL, _MODEL_LOADED
+    if not _MODEL_LOADED:
+        _MODEL_LOADED = True
+        p = ROOT / "model.json"
+        if p.exists():
+            _MODEL = json.loads(p.read_text("utf-8"))
+    return _MODEL
+
+
+def model_score(title: str, unit: str) -> float | None:
+    """「本司會不會挑這個案子」機率（以同仁過去人工挑選紀錄訓練，見 train_model.py）"""
+    import math
+    m = _model()
+    if not m:
+        return None
+    from tender_model import char_wb, text_of
+    z = m["intercept"] + sum(m["weights"].get(g, 0.0) for g in char_wb(text_of(title, unit), *m["ngram"]))
+    return 1 / (1 + math.exp(-max(-30, min(30, z))))
+
+
+def match_record(rec: dict, cfg: dict, use_model: bool = True) -> dict | None:
+    """篩選：關鍵字規則「或」AI 模型（推薦度 ≥ 門檻）任一選中即符合。"""
     ttype, title, unit = rec["type"], rec["title"], rec["unit_name"]
     f = cfg["filters"]
     if f.get("type_include") and not contains_any(ttype, f["type_include"]):
@@ -226,6 +251,33 @@ def match_record(rec: dict, cfg: dict) -> dict | None:
         return None
     if f.get("unit_include") and not contains_any(unit, f["unit_include"]):
         return None
+
+    mcfg = cfg.get("model", {})
+    prob = model_score(title, unit) if use_model and mcfg.get("enabled", True) else None
+    th = float(mcfg.get("threshold", 0.9))
+    model_hit = prob is not None and prob >= th
+
+    rule = _rule_match(title, unit, cfg)
+    if not rule and not model_hit:
+        return None
+    groups, kws, score = rule if rule else ([], [], 0)
+    if model_hit:
+        groups = groups + [f"AI推薦{prob:.2f}"]
+        score += round(prob * 10)
+    return {
+        **rec,
+        "groups": groups,
+        "keywords": kws,
+        "score": score,
+        "ai": round(prob, 2) if prob is not None else None,
+        "url": (f"{PCC}/prkms/urlSelector/common/tpam?pk={rec['pk']}" if rec.get("source") == "search"
+                else DETAIL_URL.format(pk=rec["pk"])) if rec["pk"] else TODAY_URL,
+    }
+
+
+def _rule_match(title: str, unit: str, cfg: dict):
+    """關鍵字規則；回傳 (群組, 命中詞, 分數) 或 None"""
+    f = cfg["filters"]
     if contains_any(unit, f.get("unit_exclude", [])):
         return None
     if contains_any(title, f.get("title_exclude", [])):
@@ -260,15 +312,7 @@ def match_record(rec: dict, cfg: dict) -> dict | None:
             score += g.get("priority", 1) * (2 * len(set(strong)) + len(set(weak)))
     if not groups_hit:
         return None
-
-    return {
-        **rec,
-        "groups": groups_hit,
-        "keywords": sorted(set(kw_hit), key=kw_hit.index),
-        "score": score,
-        "url": (f"{PCC}/prkms/urlSelector/common/tpam?pk={rec['pk']}" if rec.get("source") == "search"
-                else DETAIL_URL.format(pk=rec["pk"])) if rec["pk"] else TODAY_URL,
-    }
+    return groups_hit, sorted(set(kw_hit), key=kw_hit.index), score
 
 
 def roc_to_dt(s: str) -> datetime | None:
