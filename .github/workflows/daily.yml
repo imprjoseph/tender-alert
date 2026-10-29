@@ -52,8 +52,25 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安裝套件
+      - name: 安裝套件（雲端主機）
+        if: runner.environment == 'github-hosted'
         run: python -m pip install --user -q -r requirements.txt
+
+      - name: 安裝套件（公司電腦）
+        if: runner.environment == 'self-hosted'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $py = Get-Command python -ErrorAction SilentlyContinue
+          $who = whoami
+          Write-Host "::notice title=環境::python=$($py.Source) user=$who"
+          $out = & python -m pip install --user -q --disable-pip-version-check -r requirements.txt 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            $msg = ($out -replace "`r?`n", " ").Substring(0, [Math]::Min(900, $out.Length))
+            Write-Host "::error title=pip 失敗::$msg"
+            exit 1
+          }
+          Write-Host "::notice title=套件::安裝完成"
 
       - name: 執行標案掃描
         env:
