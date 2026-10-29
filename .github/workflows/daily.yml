@@ -39,7 +39,7 @@ jobs:
   run:
     # 採購網阻擋海外連線，須在台灣的電腦上執行（自架執行器）。
     # 若要改回 GitHub 雲端主機，把下一行改成：runs-on: ubuntu-latest
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tender-tw]
     timeout-minutes: 40
     env:
       PYTHONUTF8: "1"
