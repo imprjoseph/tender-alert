@@ -41,6 +41,11 @@ jobs:
     # 若要改回 GitHub 雲端主機，把下一行改成：runs-on: ubuntu-latest
     runs-on: [self-hosted, tender-tw]
     timeout-minutes: 40
+    # 公司電腦的 PowerShell 執行原則禁止腳本，預設 shell 會失敗；改用 Bypass（僅限此程序）
+    # 若改回 GitHub 雲端主機（ubuntu-latest），請刪除這個 defaults 區塊
+    defaults:
+      run:
+        shell: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
@@ -56,7 +61,6 @@ jobs:
       # so install the official Python into the runner's tool folder once, then reuse it.
       - name: Setup Python (office PC)
         if: runner.environment == 'self-hosted'
-        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $root = Join-Path $env:RUNNER_TOOL_CACHE "py312"
