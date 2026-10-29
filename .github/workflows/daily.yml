@@ -56,21 +56,31 @@ jobs:
         if: runner.environment == 'github-hosted'
         run: python -m pip install --user -q -r requirements.txt
 
-      - name: 安裝套件（公司電腦）
+      - name: Setup Python (office PC)
         if: runner.environment == 'self-hosted'
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          $py = Get-Command python -ErrorAction SilentlyContinue
+          $cands = @()
+          $c = Get-Command python -ErrorAction SilentlyContinue
+          if ($c -and $c.Source -notlike "*WindowsApps*") { $cands += $c.Source }
+          $cands += Get-ChildItem "C:\Program Files\Python3*\python.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          $cands += Get-ChildItem "C:\Python3*\python.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          $py = $cands | Select-Object -First 1
           $who = whoami
-          Write-Host "::notice title=環境::python=$($py.Source) user=$who"
-          $out = & python -m pip install --user -q --disable-pip-version-check -r requirements.txt 2>&1 | Out-String
+          if (-not $py) { Write-Host "::error title=python::Python not found. user=$who PATH=$env:PATH"; exit 1 }
+          Write-Host "::notice title=python::$py user=$who"
+          $dir = Split-Path $py
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dir "Scripts")
+          $out = & $py -m pip install --user -q --disable-pip-version-check -r requirements.txt 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) {
-            $msg = ($out -replace "`r?`n", " ").Substring(0, [Math]::Min(900, $out.Length))
-            Write-Host "::error title=pip 失敗::$msg"
+            $msg = ($out -replace "`r?`n", " ")
+            if ($msg.Length -gt 900) { $msg = $msg.Substring($msg.Length - 900) }
+            Write-Host "::error title=pip::$msg"
             exit 1
           }
-          Write-Host "::notice title=套件::安裝完成"
+          Write-Host "::notice title=pip::ok"
 
       - name: 執行標案掃描
         env:
