@@ -48,8 +48,31 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.12"
+
+      # Office PC: the service account cannot run setup-python's script (execution policy),
+      # so install the official Python into the runner's tool folder once, then reuse it.
+      - name: Setup Python (office PC)
+        if: runner.environment == 'self-hosted'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TOOL_CACHE "py312"
+          $py = Join-Path $root "python.exe"
+          if (-not (Test-Path $py)) {
+            Write-Output "Installing Python 3.12 into $root"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $exe = Join-Path $env:RUNNER_TEMP "python-3.12.10-amd64.exe"
+            Invoke-WebRequest "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile $exe -UseBasicParsing
+            $p = Start-Process $exe -ArgumentList "/quiet","InstallAllUsers=0","TargetDir=$root","PrependPath=0","Include_test=0","Include_launcher=0","Include_doc=0","Shortcuts=0","AssociateFiles=0","Include_pip=1" -Wait -PassThru
+            Write-Output "installer exit code: $($p.ExitCode)"
+          }
+          if (-not (Test-Path $py)) { Write-Output "::error title=python::install failed at $root"; exit 1 }
+          & $py --version
+          Add-Content -Path $env:GITHUB_PATH -Value $root
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $root "Scripts")
 
       - name: 安裝套件
         run: python -m pip install -q --disable-pip-version-check -r requirements.txt
