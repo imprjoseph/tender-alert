@@ -114,7 +114,8 @@ def _sync_db(raw_rows: list[dict]) -> tuple[int, int, int, list[dict]]:
                     updated += 1
                     to_sheet.append(r)
                 db[k] = r
-            elif k in db:
+            elif k in db and db[k].get("資料來源", "search") in ("search", "today"):
+                # 只自動移除系統掃描來源；人工整理、AI回溯的案件不因重新篩選而刪除
                 del db[k]
                 removed += 1
                 to_sheet.append(r)   # 符合欄為空 → 雲端端會移除（未填備註者）
