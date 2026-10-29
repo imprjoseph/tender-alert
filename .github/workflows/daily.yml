@@ -48,39 +48,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v6
-        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.12"
 
-      - name: 安裝套件（雲端主機）
-        if: runner.environment == 'github-hosted'
-        run: python -m pip install --user -q -r requirements.txt
-
-      - name: Setup Python (office PC)
-        if: runner.environment == 'self-hosted'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-          $cands = @()
-          $c = Get-Command python -ErrorAction SilentlyContinue
-          if ($c -and $c.Source -notlike "*WindowsApps*") { $cands += $c.Source }
-          $cands += Get-ChildItem "C:\Program Files\Python3*\python.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-          $cands += Get-ChildItem "C:\Python3*\python.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-          $py = $cands | Select-Object -First 1
-          $who = whoami
-          if (-not $py) { Write-Host "::error title=python::Python not found. user=$who PATH=$env:PATH"; exit 1 }
-          Write-Host "::notice title=python::$py user=$who"
-          $dir = Split-Path $py
-          Add-Content -Path $env:GITHUB_PATH -Value $dir
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dir "Scripts")
-          $out = & $py -m pip install --user -q --disable-pip-version-check -r requirements.txt 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) {
-            $msg = ($out -replace "`r?`n", " ")
-            if ($msg.Length -gt 900) { $msg = $msg.Substring($msg.Length - 900) }
-            Write-Host "::error title=pip::$msg"
-            exit 1
-          }
-          Write-Host "::notice title=pip::ok"
+      - name: 安裝套件
+        run: python -m pip install -q --disable-pip-version-check -r requirements.txt
 
       - name: 執行標案掃描
         env:
