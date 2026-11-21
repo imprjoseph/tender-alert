@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import csv
 import json
 import os
@@ -52,52 +51,38 @@ PCC = "https://web.pcc.gov.tw"
 TODAY_URL = f"{PCC}/prkms/today/common/todayTender"
 DETAIL_URL = f"{PCC}/tps/QueryTender/query/searchTenderDetail?pkPmsMain={{pk}}"
 FIXTURE_DIR = os.environ.get("PCC_FIXTURE_DIR")  # 離線測試用：today.html、detail_<pk>.html
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+UA = "IMPR-Tender-Alert/0.2 (+https://github.com/imprjoseph/tender-alert)"
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9"})
-_browser_runtime = _browser = _browser_context = _browser_page = None
 _session_ready = False
+_last_request_at = None
 SEARCH_INDEX = f"{PCC}/prkms/tender/common/basic/indexTenderBasic"
+
+
+class SourceBlocked(RuntimeError):
+    pass
 
 
 def _check_captcha(html: str) -> None:
     if "驗證碼檢核" in html or "請輸入驗證碼" in html:
         raise CaptchaBlocked("採購網要求人工驗證，已停止自動查詢")
+    if re.search(r'The URL you requested has been blocked|Web Page Blocked!|Access Denied', html, re.I):
+        raise SourceBlocked("採購網防護系統拒絕本次連線；已停止，不重試、不切換來源。請聯繫採購網管理者確認存取方式。")
 
 
-def _close_browser() -> None:
-    if _browser is not None:
-        _browser.close()
-    if _browser_runtime is not None:
-        _browser_runtime.stop()
-
-
-atexit.register(_close_browser)
-
-
-def _browser_html(url: str) -> str:
-    """HTTP 連線失敗時，使用正常瀏覽器開啟官方頁面；不處理驗證碼。"""
-    global _browser_runtime, _browser, _browser_context, _browser_page
-    if _browser_page is None:
-        from playwright.sync_api import sync_playwright
-        _browser_runtime = sync_playwright().start()
-        _browser = _browser_runtime.chromium.launch(headless=True)
-        _browser_context = _browser.new_context(locale="zh-TW")
-        _browser_page = _browser_context.new_page()
-        response = _browser_page.goto(SEARCH_INDEX, wait_until="domcontentloaded", timeout=60000)
-        html = _browser_page.content()
-        _check_captcha(html)
-        if response is None or response.status >= 400:
-            raise RuntimeError("瀏覽器無法載入採購網查詢入口")
-        time.sleep(4)
-    response = _browser_page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    html = _browser_page.content()
-    _check_captcha(html)
-    if response is None or response.status >= 400:
-        raise RuntimeError(f"瀏覽器查詢 HTTP {response.status if response else '無回應'}")
-    return html
+def _request(url: str, referer: str):
+    global _last_request_at
+    if _last_request_at is not None:
+        wait = 7 - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+    _last_request_at = time.monotonic()
+    response = _session.get(url, timeout=40, headers={"Referer": referer})
+    response.encoding = "utf-8"
+    _check_captcha(response.text)
+    response.raise_for_status()
+    return response
 
 
 # ---------------------------------------------------------------- 資料抓取
@@ -106,35 +91,21 @@ def _get_html(url: str, fixture: str) -> str:
     if FIXTURE_DIR:
         f = Path(FIXTURE_DIR) / fixture
         return f.read_text("utf-8", errors="replace") if f.exists() else ""
-    if _browser_page is not None:
-        return _browser_html(url)
     last_err = None
     for attempt in range(3):
         try:
             if not _session_ready:
-                entry = _session.get(SEARCH_INDEX, timeout=30)
-                _check_captcha(entry.text)
-                entry.raise_for_status()
+                _request(f"{PCC}/pis/", f"{PCC}/")
+                _request(SEARCH_INDEX, f"{PCC}/pis/")
                 _session_ready = True
-                time.sleep(4)
-            r = _session.get(url, timeout=40, headers={"Referer": SEARCH_INDEX})
-            _check_captcha(r.text)
-            r.raise_for_status()
-            r.encoding = "utf-8"
-            return r.text
-        except CaptchaBlocked:
+            return _request(url, SEARCH_INDEX).text
+        except (CaptchaBlocked, SourceBlocked):
             raise
         except requests.RequestException as e:
             last_err = e
             if attempt < 2:
                 time.sleep(10 * (attempt + 1))
-    print(f"⚠️  HTTP 查詢失敗，改用瀏覽器讀取官方頁面：{type(last_err).__name__}", flush=True)
-    try:
-        return _browser_html(url)
-    except CaptchaBlocked:
-        raise
-    except Exception as browser_err:
-        raise RuntimeError(f"採購網連線失敗：HTTP={last_err}；瀏覽器={browser_err}") from browser_err
+    raise RuntimeError(f"採購網連線失敗：{url} → {last_err}") from last_err
 
 
 def _text(html: str) -> str:
@@ -761,7 +732,7 @@ def main() -> int:
         recs = fetch_search(start, now, cate)
         source = "search"
         source_note = f"標案查詢（{cate}，{start:%m/%d}–{now:%m/%d}）"
-    except CaptchaBlocked:
+    except (CaptchaBlocked, SourceBlocked):
         raise
     except Exception as e:  # noqa: BLE001  — 查詢頁失敗時改用今日招標頁
         print(f"⚠️  標案查詢失敗（{type(e).__name__}: {e}），改用今日招標頁")

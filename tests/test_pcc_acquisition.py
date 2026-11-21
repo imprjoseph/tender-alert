@@ -27,6 +27,7 @@ class AcquisitionTests(unittest.TestCase):
         self.clock = patch.object(app, "datetime", wraps=datetime).start()
         self.clock.now.return_value = self.d
         self.sleep = patch.object(app.time, "sleep").start()
+        patch.object(app, '_last_request_at', None).start()
         self.addCleanup(patch.stopall)
 
     def search(self, html, **kwargs):
@@ -83,32 +84,46 @@ class AcquisitionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '官方網域'):
             self.search(page(2, next_url='https://example.com/'))
 
-    def test_http_500_switches_to_browser(self):
-        with patch.object(app, 'FIXTURE_DIR', None), patch.object(app, '_browser_page', None), \
+    def test_generic_http_500_is_retried_three_times(self):
+        with patch.object(app, 'FIXTURE_DIR', None), \
              patch.object(app, '_session_ready', True), patch.object(app._session, 'get', side_effect=requests.HTTPError('500')), \
-             patch.object(app, '_browser_html', return_value='browser HTML') as browser:
-            self.assertEqual(app._get_html(app.TODAY_URL, 'today.html'), 'browser HTML')
-        browser.assert_called_once_with(app.TODAY_URL)
-        self.assertEqual(self.sleep.call_count, 2)
+             patch.object(app, '_request', side_effect=requests.HTTPError('500')) as request:
+            with self.assertRaisesRegex(RuntimeError, '連線失敗'):
+                app._get_html(app.TODAY_URL, 'today.html')
+        self.assertEqual(request.call_count, 3)
 
     def test_captcha_does_not_retry_or_switch(self):
         response = Mock(text='驗證碼檢核')
-        with patch.object(app, 'FIXTURE_DIR', None), patch.object(app, '_browser_page', None), \
-             patch.object(app, '_session_ready', True), patch.object(app._session, 'get', return_value=response) as get, \
-             patch.object(app, '_browser_html') as browser:
+        with patch.object(app, 'FIXTURE_DIR', None), \
+             patch.object(app, '_session_ready', True), patch.object(app._session, 'get', return_value=response) as get:
             with self.assertRaises(app.CaptchaBlocked):
                 app._get_html(app.TODAY_URL, 'today.html')
         self.assertEqual(get.call_count, 1)
-        browser.assert_not_called()
+        self.sleep.assert_not_called()
+
+    def test_explicit_block_is_not_retried(self):
+        response = Mock(text='<title>The URL you requested has been blocked</title>')
+        with patch.object(app, 'FIXTURE_DIR', None), patch.object(app, '_session_ready', True), \
+             patch.object(app._session, 'get', return_value=response) as get:
+            with self.assertRaises(app.SourceBlocked):
+                app._get_html(app.TODAY_URL, 'today.html')
+        get.assert_called_once()
         self.sleep.assert_not_called()
 
     def test_requests_initialize_session(self):
         response = Mock(text='ok')
-        with patch.object(app, 'FIXTURE_DIR', None), patch.object(app, '_browser_page', None), \
+        with patch.object(app, 'FIXTURE_DIR', None), \
              patch.object(app, '_session_ready', False), patch.object(app._session, 'get', return_value=response) as get:
             self.assertEqual(app._get_html(app.TODAY_URL, 'today.html'), 'ok')
-        self.assertEqual(get.call_args_list[0].args[0], app.SEARCH_INDEX)
-        self.assertEqual(get.call_args_list[1].kwargs['headers']['Referer'], app.SEARCH_INDEX)
+        self.assertEqual(get.call_args_list[0].args[0], app.PCC + '/pis/')
+        self.assertEqual(get.call_args_list[1].args[0], app.SEARCH_INDEX)
+        self.assertEqual(get.call_args_list[2].kwargs['headers']['Referer'], app.SEARCH_INDEX)
+
+    def test_request_rate_is_limited(self):
+        with patch.object(app, '_last_request_at', 100), patch.object(app.time, 'monotonic', return_value=102), \
+             patch.object(app._session, 'get', return_value=Mock(text='ok')):
+            app._request(app.TODAY_URL, app.SEARCH_INDEX)
+        self.sleep.assert_called_once_with(5)
 
     def test_today_zero_is_valid(self):
         html = '<strong>□公開招標公告□ 總筆數:0</strong><tbody><tr><td>無符合條件資料</td></tr></tbody>'
@@ -138,6 +153,15 @@ class AcquisitionTests(unittest.TestCase):
              patch.object(app, 'fetch_search', side_effect=app.CaptchaBlocked('驗證碼')), \
              patch.object(app, 'fetch_today') as fallback:
             with self.assertRaises(app.CaptchaBlocked):
+                app.main()
+        fallback.assert_not_called()
+
+    def test_main_stops_all_sources_on_explicit_block(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'LAST_OK', Path(tmp)/'last_success.txt'), \
+             patch.object(sys, 'argv', ['tender_alert.py', '--dry-run']), \
+             patch.object(app, 'fetch_search', side_effect=app.SourceBlocked('blocked')), \
+             patch.object(app, 'fetch_today') as fallback:
+            with self.assertRaises(app.SourceBlocked):
                 app.main()
         fallback.assert_not_called()
 
