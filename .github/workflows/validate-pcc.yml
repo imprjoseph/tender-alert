@@ -1,0 +1,46 @@
+name: 採購網修復驗證（不寄信）
+
+on:
+  push:
+    branches: [fix/pcc-500-browser-fallback]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tender-alert
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: [self-hosted, tender-tw]
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v5
+      - name: 使用現有 Python
+        run: |
+          $pyRoot = Join-Path $env:RUNNER_TOOL_CACHE "py312"
+          if (-not (Test-Path (Join-Path $pyRoot "python.exe"))) { throw "找不到原排程使用的 Python 3.12" }
+          Add-Content -Path $env:GITHUB_PATH -Value $pyRoot
+      - name: 安裝套件
+        run: python -m pip install -q --disable-pip-version-check -r requirements.txt
+      - name: 安裝備援瀏覽器
+        run: python -m playwright install chromium
+      - name: 檢查資料擷取防護
+        run: python -m unittest discover -s tests -v
+      - name: 實際查詢（不寄信、不更新資料庫）
+        run: python -u tender_alert.py --dry-run --ignore-seen
+      - name: 保存驗證預覽
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: pcc-fix-preview
+          path: preview.html
+          if-no-files-found: ignore

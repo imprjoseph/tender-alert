@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import os
@@ -32,6 +33,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from html import escape, unescape
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -55,24 +57,84 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9"})
+_browser_runtime = _browser = _browser_context = _browser_page = None
+_session_ready = False
+SEARCH_INDEX = f"{PCC}/prkms/tender/common/basic/indexTenderBasic"
+
+
+def _check_captcha(html: str) -> None:
+    if "驗證碼檢核" in html or "請輸入驗證碼" in html:
+        raise CaptchaBlocked("採購網要求人工驗證，已停止自動查詢")
+
+
+def _close_browser() -> None:
+    if _browser is not None:
+        _browser.close()
+    if _browser_runtime is not None:
+        _browser_runtime.stop()
+
+
+atexit.register(_close_browser)
+
+
+def _browser_html(url: str) -> str:
+    """HTTP 連線失敗時，使用正常瀏覽器開啟官方頁面；不處理驗證碼。"""
+    global _browser_runtime, _browser, _browser_context, _browser_page
+    if _browser_page is None:
+        from playwright.sync_api import sync_playwright
+        _browser_runtime = sync_playwright().start()
+        _browser = _browser_runtime.chromium.launch(headless=True)
+        _browser_context = _browser.new_context(locale="zh-TW")
+        _browser_page = _browser_context.new_page()
+        response = _browser_page.goto(SEARCH_INDEX, wait_until="domcontentloaded", timeout=60000)
+        html = _browser_page.content()
+        _check_captcha(html)
+        if response is None or response.status >= 400:
+            raise RuntimeError("瀏覽器無法載入採購網查詢入口")
+        time.sleep(4)
+    response = _browser_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    html = _browser_page.content()
+    _check_captcha(html)
+    if response is None or response.status >= 400:
+        raise RuntimeError(f"瀏覽器查詢 HTTP {response.status if response else '無回應'}")
+    return html
 
 
 # ---------------------------------------------------------------- 資料抓取
 def _get_html(url: str, fixture: str) -> str:
+    global _session_ready
     if FIXTURE_DIR:
         f = Path(FIXTURE_DIR) / fixture
         return f.read_text("utf-8", errors="replace") if f.exists() else ""
+    if _browser_page is not None:
+        return _browser_html(url)
     last_err = None
-    for attempt in range(6):
+    for attempt in range(3):
         try:
-            r = _session.get(url, timeout=40)
+            if not _session_ready:
+                entry = _session.get(SEARCH_INDEX, timeout=30)
+                _check_captcha(entry.text)
+                entry.raise_for_status()
+                _session_ready = True
+                time.sleep(4)
+            r = _session.get(url, timeout=40, headers={"Referer": SEARCH_INDEX})
+            _check_captcha(r.text)
             r.raise_for_status()
             r.encoding = "utf-8"
             return r.text
-        except Exception as e:  # noqa: BLE001
+        except CaptchaBlocked:
+            raise
+        except requests.RequestException as e:
             last_err = e
-            time.sleep(min(90, 10 * (attempt + 1)))
-    raise RuntimeError(f"採購網連線失敗：{url} → {last_err}")
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))
+    print(f"⚠️  HTTP 查詢失敗，改用瀏覽器讀取官方頁面：{type(last_err).__name__}", flush=True)
+    try:
+        return _browser_html(url)
+    except CaptchaBlocked:
+        raise
+    except Exception as browser_err:
+        raise RuntimeError(f"採購網連線失敗：HTTP={last_err}；瀏覽器={browser_err}") from browser_err
 
 
 def _text(html: str) -> str:
@@ -91,34 +153,48 @@ def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pa
     from urllib.parse import quote
     base = SEARCH_URL.format(cate=CATE_CODE.get(cate, ""), start=quote(start.strftime("%Y/%m/%d"), safe=""),
                              end=quote(end.strftime("%Y/%m/%d"), safe=""))
-    recs, total = [], None
+    recs, total, seen_pages, seen_records = [], None, set(), set()
+    url = base
     for page in range(1, max_pages + 1):
-        url = base if page == 1 else f"{base}&firstSearch=false&d-49738-p={page}"
+        if url in seen_pages:
+            raise RuntimeError("標案查詢分頁重複，資料不完整")
+        seen_pages.add(url)
         html = _get_html(url, f"search_p{page}.html")
-        if "驗證碼檢核" in html:
-            raise CaptchaBlocked()
+        _check_captcha(html)
         flat = re.sub(r"\s+", " ", html)
         if total is None:
             m = re.search(r'共有<span class="red">\s*([\d,]+)\s*</span>筆', flat)
-            total = int(m.group(1).replace(",", "")) if m else 0
-        tb = flat[flat.find("<tbody>", flat.find('id="tpam"')):]
+            if not m:
+                raise RuntimeError("標案查詢頁缺少結果總筆數，不能判定為查無標案")
+            total = int(m.group(1).replace(",", ""))
+            if total == 0:
+                return []
+        table = re.search(r'<table\b[^>]*\bid=[\"\']tpam[\"\'][^>]*>(.*?)</table>', flat)
+        if not table:
+            raise RuntimeError("標案查詢頁缺少結果表格，資料不完整")
+        tb = table.group(1)
         rows = re.findall(r'<tr class="tb_b[23]">(.*?)</tr>', tb)
         for r in rows:
             tds = re.findall(r"<td[^>]*>(.*?)</td>", r)
             if len(tds) < 9:
                 continue
             title = re.search(r'pageCode2Img\("(.*?)"\)', tds[2])
+            title_link = re.search(r'<a\b[^>]*href=[\"\'][^\"\']*tpam\?pk=[^\"\']+[\"\'][^>]*>(.*?)</a>', tds[2])
             case_cell = _text(re.sub(r"<script.*?</script>", " ", tds[2]))
             is_corr = "更正公告" in case_cell
             job = case_cell.split("(")[0].strip().split(" ")[0]
             pk = re.search(r"tpam\?pk=([^\"&]+)", r)
+            record_key = (pk.group(1) if pk else "", _text(tds[3]), _text(tds[6]))
+            if not record_key[0] or record_key in seen_records:
+                raise RuntimeError("標案查詢出現重複分頁或缺少公告連結，資料不完整")
+            seen_records.add(record_key)
             way = _text(tds[4])
             ann = roc_to_dt(_text(tds[6]))
             recs.append({
                 "date": ann.strftime("%Y%m%d") if ann else "",
                 "type": f"{way}公告" + ("（更正公告）" if is_corr else ""),
                 "unit_name": _text(tds[1]),
-                "title": unescape(title.group(1)) if title else case_cell,
+                "title": _text(title_link.group(1)) if title_link else unescape(title.group(1)) if title else case_cell,
                 "job_number": job,
                 "seq": _text(tds[3]),
                 "pk": pk.group(1) if pk else "",
@@ -127,10 +203,18 @@ def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pa
                 "budget_text": _text(tds[8]),
                 "source": "search",
             })
-        if len(rows) < 100 or (total and len(recs) >= total):
+        if total and len(recs) >= total:
             break
+        next_link = re.search(r'<a\b[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>\s*下一頁\s*</a>', flat)
+        if not next_link:
+            raise RuntimeError(f"標案查詢分頁不完整：已取得 {len(recs)}/{total} 筆")
+        url = urljoin(url, unescape(next_link.group(1)))
+        if urlparse(url).netloc != urlparse(PCC).netloc:
+            raise RuntimeError("標案查詢分頁不是官方網域")
         if not FIXTURE_DIR:
             time.sleep(4)
+    if total and len(recs) != total:
+        raise RuntimeError(f"標案查詢未完整取得：{len(recs)}/{total} 筆；請縮小日期範圍")
     return recs
 
 
@@ -140,6 +224,7 @@ def fetch_today() -> list[dict]:
     if not html:
         raise RuntimeError("今日招標頁為空")
     flat = re.sub(r"\s+", " ", html)
+    _check_captcha(html)
     # 以各區塊標題切段：□公開招標公告□ 總筆數:597
     parts = re.split(r"<strong>\s*□(.+?)□\s*總筆數:\s*\d+\s*</strong>", flat)
     recs, today = [], datetime.now(TZ).strftime("%Y%m%d")
@@ -162,7 +247,8 @@ def fetch_today() -> list[dict]:
                 "pk": pk.group(1) if pk else "",
                 "deadline_list": _text(tds[4]),
             })
-    if not recs:
+    if not recs and not (len(parts) > 1 and all(
+            int(n) == 0 for n in re.findall(r"總筆數:\s*(\d+)", flat))):
         raise RuntimeError("今日招標頁解析不到任何案件，網頁結構可能已改版")
     return recs
 
@@ -658,6 +744,14 @@ def main() -> int:
 
     seen = {} if args.ignore_seen else load_seen()
     lookback = max(1, int(args.days or opts.get("lookback_days", 3)))
+    if not args.days and LAST_OK.exists():
+        try:
+            last_ok = datetime.strptime(LAST_OK.read_text("utf-8").strip(), "%Y-%m-%d").date()
+            lookback = max(lookback, (now.date() - last_ok).days + 1)
+            if lookback > 14:
+                raise RuntimeError("距上次成功已超過14天，需先分段回補資料")
+        except ValueError:
+            raise RuntimeError("上次成功日期格式異常，請檢查 data/last_success.txt")
     start = now - timedelta(days=lookback - 1)
     cate = opts.get("category", "勞務類")
     source_note = ""
@@ -667,11 +761,18 @@ def main() -> int:
         recs = fetch_search(start, now, cate)
         source = "search"
         source_note = f"標案查詢（{cate}，{start:%m/%d}–{now:%m/%d}）"
+    except CaptchaBlocked:
+        raise
     except Exception as e:  # noqa: BLE001  — 查詢頁失敗時改用今日招標頁
         print(f"⚠️  標案查詢失敗（{type(e).__name__}: {e}），改用今日招標頁")
-        recs = fetch_today()
+        try:
+            recs = fetch_today()
+        except Exception as today_err:
+            raise RuntimeError(f"主查詢失敗：{e}；今日備援失敗：{today_err}") from today_err
         source = "today"
         source_note = f"今日招標（{now:%m/%d}，查詢頁失敗備援）"
+        if lookback > 1:
+            raise RuntimeError(f"{source_note}取得 {len(recs)} 筆，但無法涵蓋近 {lookback} 天；本次不標記成功，保留補查")
     print(f"📥 {source_note} {len(recs)} 筆")
 
     xlsx = None
