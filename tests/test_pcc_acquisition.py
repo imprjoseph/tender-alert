@@ -91,6 +91,11 @@ class AcquisitionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '未完整'):
             self.search(page(2, next_url='?d-49738-p=2'), max_pages=1)
 
+    def test_catchup_can_exceed_thirty_pages(self):
+        pages = [page(31, rows=row(str(i)), next_url=f'?d-49738-p={i+2}' if i < 30 else None) for i in range(31)]
+        with patch.object(app, '_get_html', side_effect=pages):
+            self.assertEqual(len(app.fetch_search(self.d, self.d)), 31)
+
     def test_external_paging_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, '官方網域'):
             self.search(page(2, next_url='https://example.com/'))

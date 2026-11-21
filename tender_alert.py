@@ -120,7 +120,7 @@ SEARCH_URL = (f"{PCC}/prkms/tender/common/basic/readTenderBasic?pageSize=100&fir
 CATE_CODE = {"工程類": "RAD_PROCTRG_CATE_1", "財物類": "RAD_PROCTRG_CATE_2", "勞務類": "RAD_PROCTRG_CATE_3", "不限": ""}
 
 
-def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pages: int = 30) -> list[dict]:
+def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pages: int = 150) -> list[dict]:
     """官方「標案查詢」：依採購性質＋公告日期區間，逐頁取回（每頁 100 筆，間隔 4 秒）。"""
     from urllib.parse import quote
     base = SEARCH_URL.format(cate=CATE_CODE.get(cate, ""), start=quote(start.strftime("%Y/%m/%d"), safe=""),
