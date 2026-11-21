@@ -109,6 +109,7 @@ def _get_html(url: str, fixture: str) -> str:
 
 
 def _text(html: str) -> str:
+    html = re.sub(r'<script\b.*?</script>|<style\b.*?</style>', '', html, flags=re.S | re.I)
     return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", html))).strip()
 
 
@@ -152,6 +153,9 @@ def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pa
             title = re.search(r'pageCode2Img\("(.*?)"\)', tds[2])
             title_link = re.search(r'<a\b[^>]*href=[\"\'][^\"\']*tpam\?pk=[^\"\']+[\"\'][^>]*>(.*?)</a>', tds[2])
             case_cell = _text(re.sub(r"<script.*?</script>", " ", tds[2]))
+            parsed_title = unescape(title.group(1)) if title else _text(title_link.group(1)) if title_link else ''
+            if not parsed_title.strip() or re.search(r'pageCode2Img|Geps3\.CNS|document\.write', parsed_title):
+                raise RuntimeError("標案案名無法正確解析，停止以免產生錯誤快報")
             is_corr = "更正公告" in case_cell
             job = case_cell.split("(")[0].strip().split(" ")[0]
             pk = re.search(r"tpam\?pk=([^\"&]+)", r)
@@ -165,7 +169,7 @@ def fetch_search(start: datetime, end: datetime, cate: str = "勞務類", max_pa
                 "date": ann.strftime("%Y%m%d") if ann else "",
                 "type": f"{way}公告" + ("（更正公告）" if is_corr else ""),
                 "unit_name": _text(tds[1]),
-                "title": _text(title_link.group(1)) if title_link else unescape(title.group(1)) if title else case_cell,
+                "title": parsed_title,
                 "job_number": job,
                 "seq": _text(tds[3]),
                 "pk": pk.group(1) if pk else "",

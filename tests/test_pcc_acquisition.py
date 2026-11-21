@@ -44,6 +44,17 @@ class AcquisitionTests(unittest.TestCase):
     def test_legacy_title_is_supported(self):
         self.assertEqual(self.search(page(rows=row(script=True)))[0]['title'], '論壇服務')
 
+    def test_script_inside_title_link_is_decoded(self):
+        html = page(rows=row().replace('<span>論壇服務</span>', '<script>var hw = Geps3.CNS.pageCode2Img("論壇服務");document.write(hw);</script>'))
+        self.assertEqual(self.search(html)[0]['title'], '論壇服務')
+
+    def test_text_does_not_include_display_script(self):
+        self.assertEqual(app._text('案名<script>var hw = 1;</script>'), '案名')
+
+    def test_missing_title_is_not_a_valid_result(self):
+        with self.assertRaisesRegex(RuntimeError, '案名'):
+            self.search(page(rows=row().replace('<span>論壇服務</span>', '')))
+
     def test_verified_zero_is_valid(self):
         self.assertEqual(self.search(page(0, rows='')), [])
 
