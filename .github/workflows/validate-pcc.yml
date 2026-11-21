@@ -36,7 +36,7 @@ jobs:
       - name: 實際查詢（不寄信、不更新資料庫）
         run: python -u tender_alert.py --dry-run --ignore-seen
       - name: 確認預覽不含案名顯示程式碼
-        run: python -c "from pathlib import Path; s=Path('preview.html').read_text(encoding='utf-8'); assert 'Geps3.CNS' not in s and 'pageCode2Img' not in s, '案名仍含網頁顯示程式碼'; print('案名預覽檢查通過')"
+        run: python -c "from pathlib import Path; s=Path('preview.html').read_text(encoding='utf-8'); assert 'Geps3.CNS' not in s and 'pageCode2Img' not in s, 'Invalid tender title'; print('Preview validation passed')"
       - name: 保存驗證預覽
         if: always()
         uses: actions/upload-artifact@v5
