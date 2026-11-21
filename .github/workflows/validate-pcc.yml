@@ -35,6 +35,8 @@ jobs:
         run: python -m playwright install chromium
       - name: 檢查資料擷取防護
         run: python -m unittest discover -s tests -v
+      - name: 讀取官方網站連線診斷
+        run: python -u diagnose_pcc.py
       - name: 實際查詢（不寄信、不更新資料庫）
         run: python -u tender_alert.py --dry-run --ignore-seen
       - name: 保存驗證預覽
