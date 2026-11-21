@@ -1,0 +1,91 @@
+name: 補更新標案資料庫（不寄信）
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/backfill-20261121.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 需要把 data/seen.json、matches.csv、reports/ 存回 repo
+
+concurrency:
+  group: tender-alert
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # 採購網阻擋海外連線，須在台灣的電腦上執行（自架執行器）。
+    # 若要改回 GitHub 雲端主機，把下一行改成：runs-on: ubuntu-latest
+    runs-on: [self-hosted, tender-tw]
+    timeout-minutes: 40
+    # 公司電腦的 PowerShell 執行原則禁止腳本，預設 shell 會失敗；改用 Bypass（僅限此程序）
+    # 若改回 GitHub 雲端主機（ubuntu-latest），請刪除這個 defaults 區塊
+    defaults:
+      run:
+        shell: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.12"
+
+      # Office PC: the service account cannot run setup-python's script (execution policy),
+      # so install the official Python into the runner's tool folder once, then reuse it.
+      - name: Setup Python (office PC)
+        if: runner.environment == 'self-hosted'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TOOL_CACHE "py312"
+          $py = Join-Path $root "python.exe"
+          if (-not (Test-Path $py)) {
+            Write-Output "Installing portable Python 3.12 (python.org NuGet package) into $root"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $pkg = Join-Path $env:RUNNER_TEMP "python312.zip"
+            Invoke-WebRequest "https://www.nuget.org/api/v2/package/python/3.12.10" -OutFile $pkg -UseBasicParsing
+            $tmp = Join-Path $env:RUNNER_TEMP "python312"
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            Expand-Archive -Path $pkg -DestinationPath $tmp -Force
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+            Copy-Item -Path (Join-Path $tmp "tools\*") -Destination $root -Recurse -Force
+            & $py -m ensurepip --upgrade
+          }
+          if (-not (Test-Path $py)) { Write-Output "::error title=python::install failed at $root"; exit 1 }
+          & $py --version
+          Add-Content -Path $env:GITHUB_PATH -Value $root
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $root "Scripts")
+
+      - name: 安裝套件
+        run: python -m pip install -q --disable-pip-version-check -r requirements.txt
+
+      - name: 檢查資料擷取防護
+        run: python -m unittest discover -s tests -v
+
+      - name: 補更新標案資料庫
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          IN_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          IN_DB_ONLY: "true"
+          IN_IGNORE_SEEN: ${{ github.event.inputs.ignore_seen }}
+          IN_SYNC_ALL: ${{ github.event.inputs.sync_all }}
+          IN_RESCORE: ${{ github.event.inputs.rescore }}
+          IN_DAYS: ${{ github.event.inputs.days }}
+        run: python ci.py run
+
+      - name: 上傳 Email 預覽（dry-run 時）
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: preview
+          path: preview.html
+
+      - name: 存回紀錄
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: python ci.py commit
